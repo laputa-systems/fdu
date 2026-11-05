@@ -536,7 +536,9 @@ pub struct BatchFoldOutcome {
 /// appended entry keeps its scanner `modified_time`, and only `Complete`
 /// non-directory entries contribute to ancestor totals. `Incomplete` and
 /// `Excluded` entries mark the parent incomplete, as do `Scanning` and
-/// `Stale` entries, whose totals are not final.
+/// `Stale` entries, whose totals are not final. A directory the scan will
+/// enter is stored as `Scanning` until `finish_scan_directory` settles it, so
+/// the tree tells a finished subtree from one still being indexed.
 pub fn fold_entry_batch(
     tree: &mut Tree,
     token_nodes: &mut Vec<Option<NodeId>>,
@@ -577,7 +579,10 @@ pub fn fold_entry_batch(
             entry.link_count,
             entry.apparent_bytes,
             entry.allocated_bytes,
-            entry.state,
+            match (entry.state, entry.directory_token) {
+                (NodeStatus::Complete, Some(_)) => NodeStatus::Scanning,
+                (state, _) => state,
+            },
         ) else {
             outcome.exhausted = true;
             run.problem = true;
@@ -834,7 +839,7 @@ mod tests {
         let sub = token_nodes[1].expect("directory token is registered");
         assert_eq!(tree.name(sub), Some(b"sub".as_slice()));
         assert_eq!(tree.record(sub).unwrap().modified_time().unix_seconds(), Some(1_700_000_001));
-        assert_eq!(tree.record(sub).unwrap().state, NodeState::Complete);
+        assert_eq!(tree.record(sub).unwrap().state, NodeState::Scanning, "a directory stays scanning until its finish arrives");
         let kept = outcome.appended[1];
         assert_eq!(tree.name(kept), Some(b"kept.bin".as_slice()));
         assert_eq!(tree.record(kept).unwrap().modified_time().unix_seconds(), Some(1_700_000_002));

@@ -552,7 +552,6 @@ fn state_columns(record: &NodeRecord, mode: SizeMode) -> (&'static str, String) 
     let size = match record.state {
         NodeState::Excluded(fdu_core::ExclusionReason::MountBoundary) => "mount".to_owned(),
         NodeState::Excluded(fdu_core::ExclusionReason::UnsupportedAlias) => "alias".to_owned(),
-        NodeState::Scanning if record.entry_type == EntryType::Directory => "…".to_owned(),
         NodeState::Incomplete | NodeState::Stale => format!("~{}", format_size(value)),
         _ => format_size(value),
     };
@@ -561,7 +560,6 @@ fn state_columns(record: &NodeRecord, mode: SizeMode) -> (&'static str, String) 
 
 fn has_known_size(record: &NodeRecord) -> bool {
     !matches!(record.state, NodeState::Excluded(_))
-        && !(record.state == NodeState::Scanning && record.entry_type == EntryType::Directory)
 }
 
 fn percent_of(value: u64, total: u64) -> f64 {

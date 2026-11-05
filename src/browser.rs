@@ -2740,6 +2740,41 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_is_deletable_during_the_scan_only_after_its_finish_arrives() -> io::Result<()> {
+        let temp = TempDir::new()?;
+        let (_, mut model) = make_model(&temp, false)?;
+        let mut batch = EntryBatch::with_capacity(1, 8);
+        batch.names.extend_from_slice(b"build");
+        batch.entries.push(ScanEntry {
+            parent: DirectoryToken(0),
+            name: 0..5,
+            directory_token: Some(DirectoryToken(1)),
+            entry_type: EntryType::Directory,
+            identity: FileIdentity { device: 1, inode: 2 },
+            modified_time: ModifiedTime::from_unix_seconds(1_700_000_000).unwrap(),
+            link_count: 2,
+            apparent_bytes: 0,
+            allocated_bytes: 0,
+            state: NodeStatus::Complete,
+        });
+        model.apply_entry_batch(batch);
+        model.apply_scan_event(ScanEvent::RootListed);
+        let build = model.token_nodes[1].expect("directory token is registered");
+        model.marks.insert(build);
+        model.focus = Pane::Marked;
+
+        model.handle_intent(Intent::Delete, Phase::Scanning);
+        assert!(model.pending_delete.is_none(), "an unfinished directory is not planned");
+        assert!(model.message.as_deref().unwrap().contains("scan is still in progress"), "{:?}", model.message);
+
+        model.apply_scan_event(ScanEvent::DirectoryFinished { directory: DirectoryToken(1), complete: true });
+        model.handle_intent(Intent::Delete, Phase::Scanning);
+        let plan = model.pending_delete.as_ref().expect("a finished directory is planned while scanning");
+        assert_eq!(plan.operation_count(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn a_failed_directory_explains_itself_and_its_ancestors() -> io::Result<()> {
         let temp = TempDir::new()?;
         let (_, mut model) = make_model(&temp, false)?;
