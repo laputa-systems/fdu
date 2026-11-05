@@ -681,7 +681,7 @@ fn mounts_and_bind_mounts_below_the_root_are_boundaries_without_children() -> io
     for name in ["tmpfs", "bound"] {
         let directory = summary.directories.iter().find(|directory| directory.name == name).unwrap();
         assert_eq!(directory.disk_size, 0);
-        assert_eq!(directory.exclusion, Some(fdu_core::ExclusionReason::MountBoundary));
+        assert_eq!(directory.exclusion, Some(fdu_scan::SummaryExclusion::MountBoundary));
     }
     Ok(())
 }
