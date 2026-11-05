@@ -7,6 +7,7 @@ use fdu_core::{EntryType, ExclusionReason, FileIdentity, ModifiedTime, NodeStatu
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::RefCell;
 use std::io;
+use std::ops::ControlFlow;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
@@ -34,6 +35,8 @@ const PUBLISH_RELEASES: usize = 256;
 const HELD_OPEN_DIRECTORIES: usize = 64;
 const DIRECTORY_FINISH_BATCH_SIZE: usize = 256;
 const SEEN_DIRECTORY_SHARDS: usize = 64;
+/// How long queued work may wait with no directory begun before the extra workers start.
+const STALLED_WORKERS_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(target_os = "linux", allow(dead_code))]
@@ -91,6 +94,16 @@ struct RetainedDirectory {
     _permit: DirectoryPermit,
 }
 
+impl RetainedDirectory {
+    /// Keeps `descriptor` when the budget has room, otherwise hands it back.
+    fn within_budget(descriptor: OwnedFd, budget: &Arc<AtomicUsize>) -> Result<Self, OwnedFd> {
+        match budget.try_update(Ordering::Acquire, Ordering::Relaxed, |available| available.checked_sub(1)) {
+            Ok(_) => Ok(Self { descriptor, _permit: DirectoryPermit(Arc::clone(budget)) }),
+            Err(_) => Err(descriptor),
+        }
+    }
+}
+
 struct DirectoryPermit(Arc<AtomicUsize>);
 
 impl Drop for DirectoryPermit {
@@ -119,7 +132,39 @@ impl Drop for DirectoryLineage {
 
 enum IndexedDirectorySource {
     Opened(RetainedDirectory),
+    /// Opened by name in this parent when the task runs, so a directory whose open blocks (macOS
+    /// privacy consent, an unresponsive mount) holds up only its own subtree.
+    InParent(Arc<RetainedDirectory>),
     Reopen,
+}
+
+/// The directory a task is scanning. A retained one can be shared with its children's tasks.
+enum ScannedDirectory {
+    Retained(Arc<RetainedDirectory>),
+    Unretained(OwnedFd),
+}
+
+impl ScannedDirectory {
+    fn retain(descriptor: OwnedFd, budget: &Arc<AtomicUsize>) -> Self {
+        match RetainedDirectory::within_budget(descriptor, budget) {
+            Ok(directory) => Self::Retained(Arc::new(directory)),
+            Err(descriptor) => Self::Unretained(descriptor),
+        }
+    }
+
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Retained(directory) => directory.descriptor.as_fd(),
+            Self::Unretained(descriptor) => descriptor.as_fd(),
+        }
+    }
+
+    fn unopened_child_source(&self) -> IndexedDirectorySource {
+        match self {
+            Self::Retained(directory) => IndexedDirectorySource::InParent(Arc::clone(directory)),
+            Self::Unretained(_) => IndexedDirectorySource::Reopen,
+        }
+    }
 }
 
 struct IndexedDirectoryTask {
@@ -299,6 +344,9 @@ struct IndexedWorkQueue {
     extra_workers_open: AtomicBool,
     samples: AtomicUsize,
     blocked_samples: AtomicUsize,
+    /// Directories begun while the extra workers are still waiting. Unchanged across a wait with
+    /// work queued means every working thread is stuck, typically in an `open` that cannot return.
+    directories_started: AtomicUsize,
     park: Mutex<()>,
     /// Wakes workers that ran out of work. Separate from `gate`, so that a wake-up meant for one
     /// of them is never spent on a worker that is only waiting to be needed.
@@ -322,6 +370,7 @@ impl IndexedWorkQueue {
             extra_workers_open: AtomicBool::new(base_workers >= workers),
             samples: AtomicUsize::new(0),
             blocked_samples: AtomicUsize::new(0),
+            directories_started: AtomicUsize::new(0),
             park: Mutex::new(()),
             wake: Condvar::new(),
             gate: Condvar::new(),
@@ -395,11 +444,27 @@ impl IndexedWorkQueue {
                     // Not yet needed. Unlike a worker that has run out of work, this one does not
                     // count as starving.
                     let guard = self.park.lock().expect("indexed work queue is not poisoned");
-                    if !self.extra_workers_open.load(Ordering::Acquire)
-                        && !self.closed.load(Ordering::Acquire)
-                        && !cancelled.load(Ordering::Relaxed)
+                    if self.extra_workers_open.load(Ordering::Acquire)
+                        || self.closed.load(Ordering::Acquire)
+                        || cancelled.load(Ordering::Relaxed)
                     {
+                        continue;
+                    }
+                    if index != self.base_workers {
                         drop(self.gate.wait(guard).expect("indexed work queue is not poisoned"));
+                        continue;
+                    }
+                    let started = self.directories_started.load(Ordering::Relaxed);
+                    let (guard, wait) = self
+                        .gate
+                        .wait_timeout(guard, STALLED_WORKERS_WAIT)
+                        .expect("indexed work queue is not poisoned");
+                    drop(guard);
+                    if wait.timed_out()
+                        && self.queued.load(Ordering::SeqCst) > 0
+                        && self.directories_started.load(Ordering::Relaxed) == started
+                    {
+                        self.open_extra_workers();
                     }
                     continue;
                 }
@@ -464,12 +529,21 @@ impl IndexedWorkQueue {
         } else {
             self.blocked_samples.load(Ordering::Relaxed)
         };
-        if samples >= MINIMUM_SAMPLES
-            && blocked_samples * 4 >= samples
-            && !self.extra_workers_open.swap(true, Ordering::AcqRel)
-        {
+        if samples >= MINIMUM_SAMPLES && blocked_samples * 4 >= samples {
+            self.open_extra_workers();
+        }
+    }
+
+    fn open_extra_workers(&self) {
+        if !self.extra_workers_open.swap(true, Ordering::AcqRel) {
             drop(self.park.lock().expect("indexed work queue is not poisoned"));
             self.gate.notify_all();
+        }
+    }
+
+    fn note_directory_started(&self) {
+        if !self.extra_workers_open.load(Ordering::Relaxed) {
+            self.directories_started.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -539,7 +613,7 @@ impl Outbox {
 
     fn pop_held(&mut self) -> Option<IndexedDirectoryTask> {
         let held = self.held.pop()?;
-        if matches!(held.source, IndexedDirectorySource::Opened(_)) {
+        if matches!(held.source, IndexedDirectorySource::Opened(_) | IndexedDirectorySource::InParent(_)) {
             self.held_open -= 1;
         }
         Some(held)
@@ -731,37 +805,71 @@ fn run_task_tree(
 
 /// Opens the task's directory and scans it. False means the scan should stop.
 fn scan_indexed_task(
-    task: IndexedDirectoryTask,
+    mut task: IndexedDirectoryTask,
     context: &ScanContext<'_>,
     outbox: &mut Outbox,
 ) -> bool {
-    let reopened;
-    let directory = match &task.source {
-        IndexedDirectorySource::Opened(directory) => directory.descriptor.as_fd(),
-        IndexedDirectorySource::Reopen => {
-            reopened = match reopen_directory(&task.lineage, context.root_directory, context.root_mount) {
-                Ok(directory) => directory,
-                Err(error) => return failed_task(task.token, error.to_string(), context, outbox),
-            };
-            match describe_directory(reopened.as_fd(), context.root_mount) {
-                Ok(facts) if !facts.same_mount => {
-                    outbox.notices.push(ScanEvent::DirectoryExcluded {
-                        directory: task.token,
-                        reason: ExclusionReason::MountBoundary,
-                    });
-                    outbox.releases.push((task.token, false));
-                    return true;
-                }
-                Ok(_) => {}
+    context.queue.note_directory_started();
+    let opened = match std::mem::replace(&mut task.source, IndexedDirectorySource::Reopen) {
+        IndexedDirectorySource::Opened(directory) => {
+            ScannedDirectory::Retained(Arc::new(directory))
+        }
+        IndexedDirectorySource::InParent(parent) => {
+            let opened = open_directory_at(parent.descriptor.as_fd(), task.lineage.name.as_slice());
+            drop(parent);
+            match opened {
+                Ok(directory) => match checked_unopened_directory(directory, &task, context, outbox) {
+                    ControlFlow::Continue(directory) => directory,
+                    ControlFlow::Break(keep_running) => return keep_running,
+                },
                 Err(error) => return failed_task(task.token, error.to_string(), context, outbox),
             }
-            reopened.as_fd()
+        }
+        IndexedDirectorySource::Reopen => {
+            match reopen_directory(&task.lineage, context.root_directory, context.root_mount) {
+                Ok(directory) => match checked_unopened_directory(directory, &task, context, outbox) {
+                    ControlFlow::Continue(directory) => directory,
+                    ControlFlow::Break(keep_running) => return keep_running,
+                },
+                Err(error) => return failed_task(task.token, error.to_string(), context, outbox),
+            }
         }
     };
-    match scan_indexed_directory(directory, &task, context, outbox) {
+    match scan_indexed_directory(&opened, &task, context, outbox) {
         Ok(keep_running) => keep_running,
         Err(error) => failed_task(task.token, error.to_string(), context, outbox),
     }
+}
+
+/// Applies the identity and mount checks a directory skipped by not being opened when it was
+/// found. `Break` settles the task without a scan and says whether the scan should go on.
+fn checked_unopened_directory(
+    directory: OwnedFd,
+    task: &IndexedDirectoryTask,
+    context: &ScanContext<'_>,
+    outbox: &mut Outbox,
+) -> ControlFlow<bool, ScannedDirectory> {
+    let facts = match describe_directory(directory.as_fd(), context.root_mount) {
+        Ok(facts) => facts,
+        Err(error) => return ControlFlow::Break(failed_task(task.token, error.to_string(), context, outbox)),
+    };
+    if facts.identity != task.lineage.identity {
+        return ControlFlow::Break(failed_task(
+            task.token,
+            "directory identity changed during scan".to_owned(),
+            context,
+            outbox,
+        ));
+    }
+    if !facts.same_mount {
+        outbox.notices.push(ScanEvent::DirectoryExcluded {
+            directory: task.token,
+            reason: ExclusionReason::MountBoundary,
+        });
+        outbox.releases.push((task.token, false));
+        return ControlFlow::Break(true);
+    }
+    ControlFlow::Continue(ScannedDirectory::retain(directory, &context.descriptor_budget))
 }
 
 fn reopen_directory(
@@ -806,7 +914,7 @@ fn failed_task(
 }
 
 fn scan_indexed_directory(
-    directory: BorrowedFd<'_>,
+    directory: &ScannedDirectory,
     task: &IndexedDirectoryTask,
     context: &ScanContext<'_>,
     outbox: &mut Outbox,
@@ -839,14 +947,14 @@ impl ClassifiedEntry {
 
 fn classify_entry(
     entry: &StreamEntry<'_>,
-    directory: BorrowedFd<'_>,
+    directory: &ScannedDirectory,
     lineage: &Arc<DirectoryLineage>,
     token: DirectoryToken,
     exclusion_node: Option<usize>,
     context: &ScanContext<'_>,
     outbox: &mut Outbox,
 ) -> ClassifiedEntry {
-    let directory_fd = directory;
+    let directory_fd = directory.as_fd();
     let mut found = ClassifiedEntry {
         entry_type: EntryType::Other,
         identity: FileIdentity { device: 0, inode: 0 },
@@ -858,27 +966,25 @@ fn classify_entry(
         child_token: None,
         failure: None,
     };
-    let mut expected_identity = None;
+    let mut stat_identity = None;
     match (entry.bulk(), entry.hint()) {
-        (Some(bulk), _) => {
+        (Some(bulk), _) if bulk.entry_type != EntryType::Directory => {
             found.identity = bulk.identity;
             found.modified_time = bulk.modified_time;
             found.link_count = bulk.link_count;
             found.entry_type = bulk.entry_type;
-            expected_identity = Some(bulk.identity);
-            if bulk.entry_type != EntryType::Directory {
-                found.apparent_bytes = bulk.apparent_bytes;
-                found.allocated_bytes = bulk.allocated_bytes;
-            }
+            found.apparent_bytes = bulk.apparent_bytes;
+            found.allocated_bytes = bulk.allocated_bytes;
         }
         (None, EntryHint::Directory) => found.entry_type = EntryType::Directory,
-        (None, _) => match stat_entry_at(directory_fd, entry.name()) {
+        // Bulk attributes omit a directory's link count, which `lstat` reports without opening it.
+        _ => match stat_entry_at(directory_fd, entry.name()) {
             Ok(stat) => {
                 found.identity = stat.identity;
                 found.modified_time = stat.modified_time;
                 found.link_count = stat.link_count;
                 found.entry_type = stat.entry_type;
-                expected_identity = Some(stat.identity);
+                stat_identity = Some(stat.identity);
                 if stat.entry_type != EntryType::Directory {
                     match (stat.apparent_bytes, stat.allocated_bytes) {
                         (Ok(apparent), Ok(allocated)) => {
@@ -899,70 +1005,74 @@ fn classify_entry(
         return found;
     }
 
-    let child = match open_directory_at(directory_fd, entry.name()) {
-        Ok(child) => child,
-        Err(error) => {
-            found.incomplete(error);
-            return found;
+    let source = match stat_identity {
+        Some(_) => {
+            let source = directory.unopened_child_source();
+            if matches!(source, IndexedDirectorySource::InParent(_)) {
+                outbox.held_open += 1;
+            }
+            source
         }
-    };
-    let facts = match describe_directory(child.as_fd(), context.root_mount) {
-        Ok(facts) => facts,
-        Err(error) => {
-            found.incomplete(error);
-            return found;
-        }
-    };
-    found.link_count = facts.link_count;
-    found.modified_time = facts.modified_time;
-    if expected_identity.is_some_and(|expected| expected != facts.identity) {
-        found.incomplete("directory identity changed during scan");
-        return found;
-    }
-    found.identity = facts.identity;
-    if !facts.same_mount {
-        found.state = NodeStatus::Excluded(ExclusionReason::MountBoundary);
-    } else if !context.seen_directories.insert(facts.identity) {
-        found.state = NodeStatus::Excluded(ExclusionReason::UnsupportedAlias);
-    } else {
-        let child_token = match allocate_directory_token(context.next_token) {
-            Ok(child_token) => child_token,
-            Err(error) => {
-                found.incomplete(error);
+        None => {
+            let child = match open_directory_at(directory_fd, entry.name()) {
+                Ok(child) => child,
+                Err(error) => {
+                    found.incomplete(error);
+                    return found;
+                }
+            };
+            let facts = match describe_directory(child.as_fd(), context.root_mount) {
+                Ok(facts) => facts,
+                Err(error) => {
+                    found.incomplete(error);
+                    return found;
+                }
+            };
+            found.link_count = facts.link_count;
+            found.modified_time = facts.modified_time;
+            found.identity = facts.identity;
+            if !facts.same_mount {
+                found.state = NodeStatus::Excluded(ExclusionReason::MountBoundary);
                 return found;
             }
-        };
-        context.progress.register_child(token, child_token);
-        found.child_token = Some(child_token);
-        let source = if context.descriptor_budget
-            .try_update(Ordering::Acquire, Ordering::Relaxed, |available| available.checked_sub(1))
-            .is_ok()
-        {
-            outbox.held_open += 1;
-            IndexedDirectorySource::Opened(RetainedDirectory {
-                descriptor: child,
-                _permit: DirectoryPermit(Arc::clone(&context.descriptor_budget)),
-            })
-        } else {
-            IndexedDirectorySource::Reopen
-        };
-        outbox.held.push(IndexedDirectoryTask {
-            source,
-            lineage: Arc::new(DirectoryLineage {
-                parent: Some(Arc::clone(lineage)),
-                name: entry.name().to_bytes().to_vec(),
-                identity: facts.identity,
-            }),
-            token: child_token,
-            exclusion_node: exclusion_node.filter(|node| context.exclusions.has_children(*node)),
-        });
+            match RetainedDirectory::within_budget(child, &context.descriptor_budget) {
+                Ok(retained) => {
+                    outbox.held_open += 1;
+                    IndexedDirectorySource::Opened(retained)
+                }
+                Err(_) => IndexedDirectorySource::Reopen,
+            }
+        }
+    };
+    if !context.seen_directories.insert(found.identity) {
+        found.state = NodeStatus::Excluded(ExclusionReason::UnsupportedAlias);
+        return found;
     }
+    let child_token = match allocate_directory_token(context.next_token) {
+        Ok(child_token) => child_token,
+        Err(error) => {
+            found.incomplete(error);
+            return found;
+        }
+    };
+    context.progress.register_child(token, child_token);
+    found.child_token = Some(child_token);
+    outbox.held.push(IndexedDirectoryTask {
+        source,
+        lineage: Arc::new(DirectoryLineage {
+            parent: Some(Arc::clone(lineage)),
+            name: entry.name().to_bytes().to_vec(),
+            identity: found.identity,
+        }),
+        token: child_token,
+        exclusion_node: exclusion_node.filter(|node| context.exclusions.has_children(*node)),
+    });
     found
 }
 
 /// Scans one directory into the outbox. Returns false when the scan should stop.
 fn scan_indexed_directory_with_buffer(
-    directory: BorrowedFd<'_>,
+    directory: &ScannedDirectory,
     task: &IndexedDirectoryTask,
     context: &ScanContext<'_>,
     buffer: &mut DirectoryBuffer,

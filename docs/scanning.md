@@ -45,6 +45,15 @@ worker and checks every ancestor's identity and mount without following
 symlinks. A renamed or replaced ancestor can therefore make a deferred directory
 incomplete, even when its original directory remains accessible elsewhere.
 
+When enumeration or `lstat` already identifies a child directory, as macOS bulk
+attributes do, the child is opened by its own task rather than while its parent
+is read. That task checks the child's identity and mount. Opening a
+privacy-protected macOS folder such as `~/Documents` can block until the user
+answers the consent prompt; only that subtree waits, and the parent's listing
+is published without it. If work stays queued while no directory starts for
+half a second, the extra workers start. Quitting the browser does not wait for
+a blocked scan.
+
 See [`indexed.rs`](../crates/fdu-scan/src/indexed.rs),
 [`linux.rs`](../crates/fdu-scan/src/linux.rs), and
 [`macos.rs`](../crates/fdu-scan/src/macos.rs).

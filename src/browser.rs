@@ -106,14 +106,11 @@ impl ScanRun {
     }
 }
 
+/// An abandoned scan is cancelled but not joined: a worker can be stuck in an `open` that the OS
+/// holds until the user answers a privacy prompt, and quitting must not wait for that.
 impl Drop for ScanRun {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        self.receiver.take();
-        self.returned_batches.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
     }
 }
 
