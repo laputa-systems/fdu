@@ -155,6 +155,12 @@ pub enum ScanEvent {
         directory: DirectoryToken,
         message: String,
     },
+    /// The directory has not opened for a while, typically because macOS is waiting for the
+    /// user to answer a privacy prompt for it. The scan keeps waiting; later events for the
+    /// directory mean the open returned.
+    DirectoryWaiting {
+        directory: DirectoryToken,
+    },
     Failed {
         message: String,
     },

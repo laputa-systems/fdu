@@ -431,6 +431,19 @@ fn build_index(root: &RootAnchor, progress: &mut Progress) -> io::Result<Tree> {
             }
             ScanEvent::Finished => done = true,
             ScanEvent::RootListed => {}
+            ScanEvent::DirectoryWaiting { directory } => {
+                let path = token_nodes
+                    .get(directory.0 as usize)
+                    .copied()
+                    .flatten()
+                    .and_then(|node| tree.materialize_path(node))
+                    .map(|components| String::from_utf8_lossy(&components.join(&b'/')).into_owned());
+                progress.clear();
+                eprintln!(
+                    "fdu: still waiting to open {}; macOS may be asking for permission",
+                    path.as_deref().unwrap_or("a directory")
+                );
+            }
         }
     }
     worker

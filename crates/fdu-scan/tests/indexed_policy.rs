@@ -213,6 +213,7 @@ fn scan_to_tree_with_exclusions(
                     tree.mark_incomplete_to_root(node);
                 }
             }
+            ScanEvent::DirectoryWaiting { .. } => {}
             ScanEvent::RootListed => {
                 assert!(!root_listed, "the root is reported listed once");
                 root_listed = true;

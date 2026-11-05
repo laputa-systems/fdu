@@ -58,7 +58,10 @@ privacy-protected macOS folder such as `~/Documents` can block until the user
 answers the consent prompt; only that subtree waits, and the parent's listing
 is published without it. If work stays queued while no directory starts for
 half a second, the extra workers start. Quitting the browser does not wait for
-a blocked scan.
+a blocked scan. Each scanning thread records the directory it is opening, and a
+watcher reports an open still pending after two seconds as `DirectoryWaiting`
+once; the browser labels that directory until a later event for it shows the
+open returned.
 
 See [`indexed.rs`](../crates/fdu-scan/src/indexed.rs),
 [`linux.rs`](../crates/fdu-scan/src/linux.rs), and

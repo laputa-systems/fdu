@@ -156,7 +156,7 @@ fn main() -> io::Result<()> {
                 tree.mark_incomplete_to_root(tree.root());
             }
             ScanEvent::Finished => done = true,
-            ScanEvent::RootListed => {}
+            ScanEvent::RootListed | ScanEvent::DirectoryWaiting { .. } => {}
         }
     }
     worker

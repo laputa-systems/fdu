@@ -159,6 +159,8 @@ pub struct View<'a> {
     pub incomplete_entries: usize,
     pub exclusions: usize,
     pub scan_errors: usize,
+    /// Directories the scan is still waiting to open, typically for a macOS privacy prompt.
+    pub waiting_for_access: &'a HashSet<NodeId>,
     pub read_only: bool,
     pub range_mode: bool,
     pub message: Option<&'a str>,
@@ -361,7 +363,7 @@ fn render_rows(
         let Some(record) = view.tree.record(id) else {
             continue;
         };
-        let (marker, size_text) = state_columns(record, view.size_mode);
+        let (marker, size_text) = state_columns(record, view.size_mode, view.waiting_for_access.contains(&id));
         let mark = if view.marks.contains(&id) {
             "[x]"
         } else if view.covered_by.is_some() {
@@ -447,7 +449,7 @@ fn render_marked(frame: &mut Screen, area: Rect, view: &View<'_>, scroll: &mut S
             continue;
         };
         let is_selected = view.marked_cursor == Some(index);
-        let (marker, size_text) = state_columns(record, view.size_mode);
+        let (marker, size_text) = state_columns(record, view.size_mode, view.waiting_for_access.contains(&id));
         let age = format_age(record.modified_time(), now);
         let suffix = match record.entry_type {
             EntryType::Directory => "/",
@@ -539,7 +541,10 @@ fn format_age_seconds(seconds: u64) -> String {
     }
 }
 
-fn state_columns(record: &NodeRecord, mode: SizeMode) -> (&'static str, String) {
+fn state_columns(record: &NodeRecord, mode: SizeMode, waiting_for_access: bool) -> (&'static str, String) {
+    if waiting_for_access {
+        return ("?", "no access".to_owned());
+    }
     let value = size_of(record, mode);
     let marker = match record.state {
         NodeState::Scanning => "…",
@@ -620,13 +625,17 @@ const COMPACT_KEY_HINTS: &str = "? help · q quit";
 
 fn render_status(frame: &mut Screen, area: Rect, view: &View<'_>) {
     let count = format!(
-        "{} entries{}{}",
+        "{} entries{}{}{}",
         view.indexed_entries,
         if view.phase == Phase::Scanning { "…" } else { "" },
         match view.scan_errors {
             0 => String::new(),
             1 => " · 1 scan error".to_owned(),
             errors => format!(" · {errors} scan errors"),
+        },
+        match view.waiting_for_access.len() {
+            0 => String::new(),
+            waiting => format!(" · {waiting} awaiting access"),
         },
     );
     let (text, style) = match &view.operation {
@@ -707,7 +716,7 @@ fn help_lines(focus: Pane) -> (String, Vec<String>) {
         "Rows: [x] marked (red)  [=] covered  ! incomplete  ~ stale  M mount  A alias",
         "  / directory  @ symlink (never followed)  * hardlinked name",
         "  Directory and symlink colors follow LS_COLORS; marked rows stay red.",
-        "The count at the bottom ends in … while the scan is still running.",
+        "… means still scanning; ? no access means answer the macOS prompt.",
         "q or Ctrl-C quits. Esc or ? closes help.",
     ];
     ("Help".to_owned(), lines.iter().map(|line| (*line).to_owned()).collect())
@@ -937,6 +946,7 @@ mod tests {
         directory: NodeId,
         nested: NodeId,
         top: NodeId,
+        waiting_for_access: HashSet<NodeId>,
     }
 
     fn fixture() -> Fixture {
@@ -950,7 +960,7 @@ mod tests {
         assert!(tree.add_to_ancestors(directory, 4096, 4096));
         let top = append(&mut tree, root, b"top.log", EntryType::RegularFile, 4, 1024);
         assert!(tree.add_to_ancestors(root, 1024, 1024));
-        Fixture { tree, root, directory, nested, top }
+        Fixture { tree, root, directory, nested, top, waiting_for_access: HashSet::new() }
     }
 
     fn draw(view: &View<'_>, columns: u16, rows: u16) -> String {
@@ -987,6 +997,7 @@ mod tests {
             incomplete_entries: 0,
             exclusions: 0,
             scan_errors: 0,
+            waiting_for_access: &fixture.waiting_for_access,
             read_only: false,
             range_mode: false,
             message: None,
@@ -1030,7 +1041,7 @@ mod tests {
             rows.push(id);
         }
         let marks = HashSet::new();
-        let fixture = Fixture { tree, root, directory: root, nested: root, top: root };
+        let fixture = Fixture { tree, root, directory: root, nested: root, top: root, waiting_for_access: HashSet::new() };
         let colors = LsColors::default();
         let mut view = base_view(&fixture, &rows, &marks, &[], &colors);
         view.cursor_index = Some(rows.len() - 1);
@@ -1243,6 +1254,21 @@ mod tests {
     }
 
     #[test]
+    fn directories_awaiting_access_are_labelled_and_counted() {
+        let mut fixture = fixture();
+        fixture.waiting_for_access.insert(fixture.directory);
+        let rows = [fixture.directory, fixture.top];
+        let marks = HashSet::new();
+        let colors = LsColors::default();
+        let mut view = base_view(&fixture, &rows, &marks, &[], &colors);
+        view.phase = Phase::Scanning;
+        let output = draw(&view, 100, 24);
+        let row = output.lines().find(|line| line.contains("projects/")).expect("directory row");
+        assert!(row.contains("?  no access"), "{row}");
+        assert!(output.lines().last().unwrap().contains("entries… · 1 awaiting access"), "{output}");
+    }
+
+    #[test]
     fn scan_errors_are_counted_beside_the_entry_count() {
         let fixture = fixture();
         let rows = [fixture.directory, fixture.top];
@@ -1308,7 +1334,7 @@ mod tests {
     fn renderer_handles_tiny_empty_listing_and_confirmation_modal() {
         let tree = Tree::new(b"root", FileIdentity { device: 1, inode: 1 }, 1).unwrap();
         let root = tree.root();
-        let fixture = Fixture { tree, root, directory: root, nested: root, top: root };
+        let fixture = Fixture { tree, root, directory: root, nested: root, top: root, waiting_for_access: HashSet::new() };
         let marks = HashSet::<NodeId>::new();
         let selected = [];
         let colors = LsColors::default();
@@ -1330,7 +1356,7 @@ mod tests {
             );
         }
         let marks = HashSet::new();
-        let fixture = Fixture { tree, root, directory: root, nested: root, top: root };
+        let fixture = Fixture { tree, root, directory: root, nested: root, top: root, waiting_for_access: HashSet::new() };
         let colors = LsColors::default();
         let view = base_view(&fixture, &rows, &marks, &[], &colors);
         let output = draw(&view, 44, 10);

@@ -46,6 +46,10 @@ incomplete. Browser deletion skips incomplete and excluded entries and deletes
 the rest. Deletion does not wait for the whole scan: once the root directory is
 listed, a marked entry whose scan has finished can be deleted while the rest of
 the tree is still scanning. The scan pauses during deletion and then resumes.
+On macOS, a directory that has not opened after two seconds, usually because
+macOS is waiting for you to answer a privacy prompt for it, shows `? no access`
+and is counted as awaiting access in the status line. The scan keeps waiting
+and continues with that directory once access is granted.
 
 By default, sizes are filesystem-allocated bytes; `--apparent` uses logical
 file lengths. Use `--read-only` to disable deletion in the browser. The summary

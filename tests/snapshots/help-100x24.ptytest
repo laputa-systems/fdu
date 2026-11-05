@@ -21,7 +21,7 @@ modes: alternate-screen=true application-cursor=false application-keypad=false b
 17││··│Rows:·[x]·marked·(red)··[=]·covered··!·incomplete··~·stale··M·mount··A·alias················│··│
 18││··│··/·directory··@·symlink·(never·followed)··*·hardlinked·name································│··│
 19││··│··Directory·and·symlink·colors·follow·LS_COLORS;·marked·rows·stay·red.······················│··│
-20││··│The·count·at·the·bottom·ends·in·…·while·the·scan·is·still·running.··························│··│
+20││··│…·means·still·scanning;·?·no·access·means·answer·the·macOS·prompt.··························│··│
 21││··│q·or·Ctrl-C·quits.·Esc·or·?·closes·help.····················································│··│
 22│└──└────────────────────────────────────────────────────────────────────────────────────────────┘──┘
 23│·192238·entries···d·mark···s·sort···/·filter···?·help···q·quit······································

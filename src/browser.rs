@@ -28,6 +28,8 @@ const DELETE_CHANNEL_CAPACITY: usize = 8;
 /// still get their turn.
 const SCAN_DRAIN_BUDGET: Duration = Duration::from_millis(4);
 const MAX_DELETE_EVENTS_PER_TICK: usize = 32;
+const WAITING_FOR_ACCESS: &str =
+    "Waiting for macOS to allow access: answer its privacy prompt, or grant this terminal Full Disk Access.";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// While scanning, an idle tick waits this long for the next scan event rather than for input,
 /// so the scanner is never left blocked on a full channel while the interface sleeps.
@@ -318,6 +320,9 @@ struct BrowserModel {
     /// The running scan has sent every entry directly in the root. Deletion creates its
     /// quarantine there, so it waits for this to keep the scan from indexing the quarantine.
     root_listed: bool,
+    /// Directories whose open the scanner reported as pending, until a later event shows it
+    /// returned.
+    waiting_for_access: HashSet<NodeId>,
     read_only: bool,
     ls_colors: LsColors,
 }
@@ -488,6 +493,7 @@ impl BrowserModel {
             actual_deletions: 0,
             scanning: true,
             root_listed: false,
+            waiting_for_access: HashSet::new(),
             read_only,
             ls_colors: LsColors::from_env(),
         };
@@ -520,6 +526,7 @@ impl BrowserModel {
         self.dialog = DialogState::None;
         self.pending_delete = None;
         self.root_listed = false;
+        self.waiting_for_access.clear();
         self.message = None;
         self.status_by_node.clear();
         self.indexed_entries = 0;
@@ -552,16 +559,29 @@ impl BrowserModel {
                 false
             }
             ScanEvent::DirectoryFinished { directory, complete } => {
+                self.open_returned(directory);
                 self.finish_directory(directory, complete);
                 true
             }
             ScanEvent::DirectoriesFinished(directories) => {
                 for (directory, complete) in directories {
+                    self.open_returned(directory);
                     self.finish_directory(directory, complete);
                 }
                 true
             }
+            ScanEvent::DirectoryWaiting { directory } => {
+                let Some(node) = self.node_for_token(directory) else {
+                    return false;
+                };
+                if self.tree.record(node).is_some_and(|record| record.state == NodeState::Scanning) {
+                    self.waiting_for_access.insert(node);
+                    self.status_by_node.insert(node, WAITING_FOR_ACCESS.to_owned());
+                }
+                true
+            }
             ScanEvent::DirectoryExcluded { directory, reason } => {
+                self.open_returned(directory);
                 if let Some(node) = self.node_for_token(directory) {
                     self.set_state(node, NodeStatus::Excluded(reason));
                     if let Some(parent) = self.tree.record(node).and_then(|record| record.parent()) {
@@ -571,6 +591,7 @@ impl BrowserModel {
                 true
             }
             ScanEvent::DirectoryFailed { directory, message } => {
+                self.open_returned(directory);
                 self.scan_errors = self.scan_errors.saturating_add(1);
                 if let Some(node) = self.node_for_token(directory) {
                     self.mark_incomplete_chain(node);
@@ -601,7 +622,28 @@ impl BrowserModel {
         self.bump_incomplete(marked);
     }
 
+    fn open_returned(&mut self, directory: DirectoryToken) {
+        if self.waiting_for_access.is_empty() {
+            return;
+        }
+        if let Some(node) = self.node_for_token(directory)
+            && self.waiting_for_access.remove(&node)
+            && self.status_by_node.get(&node).is_some_and(|status| status == WAITING_FOR_ACCESS)
+        {
+            self.status_by_node.remove(&node);
+        }
+    }
+
     fn apply_entry_batch(&mut self, mut batch: fdu_core::EntryBatch) -> fdu_core::EntryBatch {
+        if !self.waiting_for_access.is_empty() {
+            let mut parent = None;
+            for entry in &batch.entries {
+                if parent != Some(entry.parent) {
+                    parent = Some(entry.parent);
+                    self.open_returned(entry.parent);
+                }
+            }
+        }
         let current_directory = self.current_directory;
         match Arc::get_mut(&mut self.tree) {
             None => {
@@ -987,6 +1029,7 @@ impl BrowserModel {
             incomplete_entries: self.incomplete_entries,
             exclusions: self.exclusions,
             scan_errors: self.scan_errors,
+            waiting_for_access: &self.waiting_for_access,
             read_only: self.read_only,
             range_mode: self.range_mode,
             message: self.message.as_deref(),
@@ -2771,6 +2814,39 @@ mod tests {
         model.handle_intent(Intent::Delete, Phase::Scanning);
         let plan = model.pending_delete.as_ref().expect("a finished directory is planned while scanning");
         assert_eq!(plan.operation_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_waiting_for_access_is_labelled_until_its_entries_arrive() -> io::Result<()> {
+        let temp = TempDir::new()?;
+        let (_, mut model) = make_model(&temp, false)?;
+        let root = model.tree.root();
+        let protected = append(&mut model, root, b"Documents", EntryType::Directory, 0, 2);
+        Arc::get_mut(&mut model.tree).unwrap().set_state(protected, NodeStatus::Scanning);
+        model.token_nodes.push(Some(protected));
+
+        model.apply_scan_event(ScanEvent::DirectoryWaiting { directory: DirectoryToken(1) });
+        assert!(model.waiting_for_access.contains(&protected));
+        assert_eq!(model.status_by_node.get(&protected).map(String::as_str), Some(super::WAITING_FOR_ACCESS));
+
+        let mut batch = EntryBatch::with_capacity(1, 16);
+        batch.names.extend_from_slice(b"report.txt");
+        batch.entries.push(ScanEntry {
+            parent: DirectoryToken(1),
+            name: 0..10,
+            directory_token: None,
+            entry_type: EntryType::RegularFile,
+            identity: FileIdentity { device: 1, inode: 3 },
+            modified_time: ModifiedTime::from_unix_seconds(1_700_000_000).unwrap(),
+            link_count: 1,
+            apparent_bytes: 5,
+            allocated_bytes: 512,
+            state: NodeStatus::Complete,
+        });
+        model.apply_entry_batch(batch);
+        assert!(model.waiting_for_access.is_empty());
+        assert_eq!(model.status_by_node.get(&protected), None);
         Ok(())
     }
 
