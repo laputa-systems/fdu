@@ -138,6 +138,9 @@ pub enum ScanEvent {
         link_count: u64,
     },
     Entries(EntryBatch),
+    /// Every entry directly in the root has been sent. Nothing the scan finds later is directly
+    /// in the root, so entries created there afterwards are never indexed.
+    RootListed,
     DirectoryFinished {
         directory: DirectoryToken,
         complete: bool,

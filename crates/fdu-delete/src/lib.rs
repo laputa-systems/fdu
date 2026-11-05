@@ -96,12 +96,14 @@ pub enum DeleteEvent {
 
 /// Plans the permanent removal of `selected` roots, which may live in different
 /// directories. Roots must not overlap, because a directory root already covers
-/// every descendant, and the scan must have finished.
+/// every descendant. The scan may still be running elsewhere in the tree; the
+/// caller must not add entries to the tree while the plan exists.
 ///
-/// Scan problems are advisory. Entries whose scan is incomplete or that are
-/// excluded are left in place and listed in `skipped`, together with the
-/// directories that hold them; everything else under the roots is planned. The
-/// plan is refused only when nothing at all can be deleted.
+/// Scan problems are advisory. Entries still being scanned, whose scan is
+/// incomplete, or that are excluded are left in place and listed in `skipped`,
+/// together with the directories that hold them; everything else under the
+/// roots is planned. The plan is refused only when nothing at all can be
+/// deleted.
 pub fn create_plan(tree: Arc<Tree>, selected: &[NodeId]) -> Result<DeletionPlan, PlanError> {
     let mut rejected = Vec::new();
     if selected.is_empty() {
@@ -130,8 +132,7 @@ pub fn create_plan(tree: Arc<Tree>, selected: &[NodeId]) -> Result<DeletionPlan,
     if !unique.is_empty() {
         let root_state = tree.record(tree.root()).expect("root record exists").state;
         let block = match root_state {
-            NodeState::Complete | NodeState::Incomplete => None,
-            NodeState::Scanning => Some("scan is still running"),
+            NodeState::Complete | NodeState::Incomplete | NodeState::Scanning => None,
             _ => Some("root totals are stale; rescan first"),
         };
         if let Some(reason) = block {
@@ -1002,14 +1003,19 @@ mod tests {
     }
 
     #[test]
-    fn running_scan_rejects_deletion_plan() {
-        let (tree, _, file, _) = test_tree();
+    fn running_scan_plans_finished_subtrees_and_skips_directories_still_scanning() {
+        let (tree, directory, file, second) = test_tree();
         let mut mutable = Arc::try_unwrap(tree).ok().unwrap();
+        let scanning = mutable
+            .append(mutable.root(), b"scanning", EntryType::Directory, FileIdentity { device: 1, inode: 9 }, 2, 0, 0, NodeStatus::Scanning)
+            .unwrap();
         mutable.set_state(mutable.root(), NodeStatus::Scanning);
-        let rejection = create_plan(Arc::new(mutable), &[file]).err().expect("running scan is rejected");
-        assert_eq!(rejection.rejected.len(), 1);
-        assert_eq!(rejection.rejected[0].node, None);
-        assert_eq!(rejection.rejected[0].reason, "scan is still running");
+        let plan = create_plan(Arc::new(mutable), &[directory, scanning]).unwrap();
+        assert_eq!(plan.targets, vec![file, second, directory]);
+        assert_eq!(plan.disposition[scanning.index()], Disposition::Retain);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].node, scanning);
+        assert_eq!(plan.skipped[0].reason, "scan is still in progress");
     }
 
     #[test]

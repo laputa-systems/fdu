@@ -43,7 +43,9 @@ root, including its subtree. Exclusion paths are relative to the selected root;
 repeat the option to omit more paths. Path components must match exactly.
 In the browser, directories whose contents include excluded paths are marked
 incomplete. Browser deletion skips incomplete and excluded entries and deletes
-the rest.
+the rest. Deletion does not wait for the whole scan: once the root directory is
+listed, a marked entry whose scan has finished can be deleted while the rest of
+the tree is still scanning. The scan pauses during deletion and then resumes.
 
 By default, sizes are filesystem-allocated bytes; `--apparent` uses logical
 file lengths. Use `--read-only` to disable deletion in the browser. The summary

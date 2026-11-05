@@ -6,15 +6,23 @@ and use the descriptor-relative engine in
 
 ## Eligibility and outcomes
 
-A plan may contain several entries, but its roots cannot overlap. The shared
-planner requires the root scan to have finished. Scan problems are advisory:
-an entry whose scan is incomplete, or that is a mount boundary or unsupported
-alias, is skipped and never entered, and everything else under the selected
-roots is planned. A directory is removed only when everything inside it is
+A plan may contain several entries, but its roots cannot overlap. The scan may still be running: an entry
+still being scanned, an entry whose scan is incomplete, or a mount boundary or
+unsupported alias is skipped and never entered, and everything else under the
+selected roots is planned. Marking a directory whose scan has finished
+therefore deletes it without waiting for the rest of the tree. A directory is removed only when everything inside it is
 planned; otherwise it stays, and its planned contents are still removed. The
 plan lists each skipped entry, and the planner rejects the selection only when
 nothing can be deleted. Browser deletion calls the shared planner when Ctrl-R
-is pressed and shows the skipped count in the confirmation. `--rmrf` stays
+is pressed and shows the skipped count in the confirmation.
+
+During a scan, Ctrl-R is refused until the scanner reports that every entry
+directly in the root has been sent. The quarantine is created in the root, and
+the scanner never lists the root again, so it cannot index the quarantine. While
+a plan awaits confirmation or deletion runs, the browser stops reading scan
+events; the bounded event channel then pauses the scanner, which resumes when
+deletion ends. The plan shares the index with the browser, so nothing may be
+added to the index while the plan exists. `--rmrf` stays
 strict: it rejects an incomplete root scan and any skipped entry before
 deleting.
 

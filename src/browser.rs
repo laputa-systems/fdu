@@ -124,10 +124,13 @@ struct DeleteRun {
     total: usize,
     skipped: usize,
     started: Instant,
+    /// The scan that was running when deletion started. Its events wait until deletion ends,
+    /// because the plan shares the index.
+    paused_scan: Option<ScanRun>,
 }
 
 impl DeleteRun {
-    fn start(root: std::os::fd::OwnedFd, plan: DeletionPlan) -> Self {
+    fn start(root: std::os::fd::OwnedFd, plan: DeletionPlan, paused_scan: Option<ScanRun>) -> Self {
         let total = plan.operation_count();
         let skipped = plan.skipped.len();
         let (sender, receiver) = mpsc::sync_channel(DELETE_CHANNEL_CAPACITY);
@@ -146,6 +149,7 @@ impl DeleteRun {
             total,
             skipped,
             started: Instant::now(),
+            paused_scan,
         }
     }
 
@@ -311,6 +315,9 @@ struct BrowserModel {
     scan_errors: usize,
     actual_deletions: usize,
     scanning: bool,
+    /// The running scan has sent every entry directly in the root. Deletion creates its
+    /// quarantine there, so it waits for this to keep the scan from indexing the quarantine.
+    root_listed: bool,
     read_only: bool,
     ls_colors: LsColors,
 }
@@ -480,6 +487,7 @@ impl BrowserModel {
             scan_errors: 0,
             actual_deletions: 0,
             scanning: true,
+            root_listed: false,
             read_only,
             ls_colors: LsColors::from_env(),
         };
@@ -511,6 +519,7 @@ impl BrowserModel {
         self.range_anchor = None;
         self.dialog = DialogState::None;
         self.pending_delete = None;
+        self.root_listed = false;
         self.message = None;
         self.status_by_node.clear();
         self.indexed_entries = 0;
@@ -538,6 +547,10 @@ impl BrowserModel {
                 true
             }
             ScanEvent::Entries(_) => false,
+            ScanEvent::RootListed => {
+                self.root_listed = true;
+                false
+            }
             ScanEvent::DirectoryFinished { directory, complete } => {
                 self.finish_directory(directory, complete);
                 true
@@ -736,8 +749,8 @@ impl BrowserModel {
         }
         if phase == Phase::Scanning {
             match intent {
-                Intent::Delete => {
-                    self.message = Some("Deletion is unavailable until scanning finishes.".to_owned());
+                Intent::Delete if !self.root_listed => {
+                    self.message = Some("Deletion is unavailable until the root directory is listed.".to_owned());
                     return (Action::None, true);
                 }
                 Intent::Refresh => {
@@ -1762,7 +1775,11 @@ fn run_session(
             }
             Action::Delete(plan) => match root.try_clone_fd() {
                 Ok(root_fd) => {
-                    phase = AppPhase::Deleting(DeleteRun::start(root_fd, plan));
+                    let paused_scan = match std::mem::replace(&mut phase, AppPhase::Ready) {
+                        AppPhase::Scanning(scan) => Some(scan),
+                        _ => None,
+                    };
+                    phase = AppPhase::Deleting(DeleteRun::start(root_fd, plan, paused_scan));
                     draw_pending = true;
                 }
                 Err(error) => {
@@ -1780,7 +1797,10 @@ fn run_session(
 
         let mut model_changed = false;
         let mut scan_finished = false;
+        // A pending plan shares the index, so scan events wait in the bounded channel, which
+        // pauses the scanner until the plan is confirmed or dropped.
         if let AppPhase::Scanning(worker) = &mut phase
+            && model.pending_delete.is_none()
             && let Some(receiver) = worker.receiver.as_ref() {
             let drain_started = Instant::now();
             let mut first_event = true;
@@ -1892,21 +1912,22 @@ fn run_session(
             }
         }
         if delete_finished {
-            let (outcomes, delete_error, skipped) = match &mut phase {
+            let (outcomes, delete_error, skipped, paused_scan) = match &mut phase {
                 AppPhase::Deleting(worker) => {
                     profile.delete_worker = Some(worker.started.elapsed());
                     let skipped = worker.skipped;
+                    let paused_scan = worker.paused_scan.take();
                     match worker.finish() {
-                        Ok((outcomes, failure)) => (outcomes, failure, skipped),
-                        Err(error) => (Vec::new(), Some(error), skipped),
+                        Ok((outcomes, failure)) => (outcomes, failure, skipped, paused_scan),
+                        Err(error) => (Vec::new(), Some(error), skipped, paused_scan),
                     }
                 }
-                _ => (Vec::new(), None, 0),
+                _ => (Vec::new(), None, 0, None),
             };
             let applying = Instant::now();
             model.apply_delete_outcomes(outcomes, delete_error, skipped);
             profile.delete_apply = Some(applying.elapsed());
-            phase = AppPhase::Ready;
+            phase = paused_scan.map_or(AppPhase::Ready, AppPhase::Scanning);
             model_changed = true;
         }
 
@@ -2605,18 +2626,30 @@ mod tests {
     }
 
     #[test]
-    fn scan_phase_rejects_delete_and_refresh_until_ready() -> io::Result<()> {
+    fn scan_phase_deletes_finished_marks_once_the_root_is_listed_and_rejects_refresh() -> io::Result<()> {
         let temp = TempDir::new()?;
         let (_, mut model) = make_model(&temp, false)?;
         let root_node = model.tree.root();
         let entry = append(&mut model, root_node, b"file", EntryType::RegularFile, 8, 2);
+        let still_scanning = append(&mut model, root_node, b"still-scanning", EntryType::Directory, 0, 3);
+        Arc::get_mut(&mut model.tree).unwrap().set_state(still_scanning, NodeStatus::Scanning);
         model.marks.insert(entry);
+        model.marks.insert(still_scanning);
         model.handle_intent(Intent::SwitchPane, Phase::Scanning);
         let (action, changed) = model.handle_intent(Intent::Delete, Phase::Scanning);
         assert!(matches!(action, Action::None));
         assert!(changed);
-        assert!(model.message.as_deref().unwrap().contains("unavailable"));
+        assert!(model.message.as_deref().unwrap().contains("until the root directory is listed"));
         assert!(model.pending_delete.is_none());
+
+        model.apply_scan_event(ScanEvent::RootListed);
+        model.handle_intent(Intent::Delete, Phase::Scanning);
+        let plan = model.pending_delete.as_ref().expect("finished marks are planned while scanning");
+        assert_eq!(plan.operation_count(), 1);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].node, still_scanning);
+        model.handle_intent(Intent::Cancel, Phase::Scanning);
+
         let (action, _) = model.handle_intent(Intent::Refresh, Phase::Scanning);
         assert!(matches!(action, Action::None));
 

@@ -430,6 +430,7 @@ fn build_index(root: &RootAnchor, progress: &mut Progress) -> io::Result<Tree> {
                 tree.mark_scanning_incomplete();
             }
             ScanEvent::Finished => done = true,
+            ScanEvent::RootListed => {}
         }
     }
     worker

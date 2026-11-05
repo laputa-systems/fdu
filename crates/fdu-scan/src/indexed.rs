@@ -1167,6 +1167,9 @@ fn scan_indexed_directory_with_buffer(
     if let Some(sample) = sample {
         context.queue.note_sample(sample.was_blocked());
     }
+    if token == DirectoryToken(0) {
+        outbox.notices.push(ScanEvent::RootListed);
+    }
     outbox.releases.push((token, complete));
     // The root's entries are what the interface shows first, so they are never held back.
     if token == DirectoryToken(0) || outbox.should_flush(context) {

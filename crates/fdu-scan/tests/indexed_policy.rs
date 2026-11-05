@@ -116,6 +116,8 @@ fn scan_to_tree_with_exclusions(
     let mut errors = Vec::new();
     let mut batches = Vec::new();
     let mut directory_finish_batch_sizes = Vec::new();
+    let mut root_listed = false;
+    let mut stopped = false;
     let mut done = false;
     while !done {
         let event = receiver
@@ -131,6 +133,10 @@ fn scan_to_tree_with_exclusions(
                 // entries with the same parent.
                 let mut run: Option<(NodeId, u64, u64)> = None;
                 for entry in &batch.entries {
+                    assert!(
+                        !(root_listed && entry.parent == DirectoryToken(0)),
+                        "a root entry arrived after the root was reported listed"
+                    );
                     let parent = tokens
                         .get(entry.parent.0 as usize)
                         .copied()
@@ -207,11 +213,22 @@ fn scan_to_tree_with_exclusions(
                     tree.mark_incomplete_to_root(node);
                 }
             }
-            ScanEvent::Failed { message } => errors.push(message),
-            ScanEvent::Cancelled => errors.push("cancelled".to_owned()),
+            ScanEvent::RootListed => {
+                assert!(!root_listed, "the root is reported listed once");
+                root_listed = true;
+            }
+            ScanEvent::Failed { message } => {
+                stopped = true;
+                errors.push(message);
+            }
+            ScanEvent::Cancelled => {
+                stopped = true;
+                errors.push("cancelled".to_owned());
+            }
             ScanEvent::Finished => done = true,
         }
     }
+    assert!(root_listed || stopped, "a scan that runs to the end reports the root listed");
     worker
         .join()
         .map_err(|_| io::Error::other("scanner worker panicked"))?;
