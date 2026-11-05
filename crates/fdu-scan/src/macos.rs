@@ -1,16 +1,18 @@
 use crate::fsutil::{self, retry};
 use crate::indexed::{BulkMetadata, DirectoryFacts, EntryHint, IndexedScanLimits};
-use crate::{ScanExclusions, ScanReport, TopLevelDirectory};
-use fdu_core::{EntryType, ExclusionReason, FileIdentity};
+use crate::{ScanExclusions, ScanReport, SummaryExclusion, TopLevelDirectory};
+use fdu_core::{EntryType, FileIdentity};
 use rustix::fs::{self, Dir, DirEntry, FileType};
 use std::cell::RefCell;
-use hashbrown::HashSet;
-use std::ffi::{CStr, CString, OsString};
+use hashbrown::{HashMap, HashSet};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStringExt;
-use std::path::Path;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 mod attributes;
 
@@ -76,11 +78,6 @@ fn entry_kind(file_type: FileType) -> EntryKind {
     }
 }
 
-struct DirectoryPath {
-    parent: Option<usize>,
-    name: Option<CString>,
-    exclusion_node: Option<usize>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MountIdentity {
@@ -292,19 +289,31 @@ impl<'buffer> IndexedDirectoryStream<'buffer> {
     }
 }
 
+/// How long one directory open may take before the summary skips that directory. Opening a
+/// folder under macOS privacy protection blocks until the user answers its consent prompt.
+const SUMMARY_OPEN_PATIENCE: Duration = Duration::from_secs(2);
+/// An open pending this long hands the rest of the work to a fresh worker, so waits overlap.
+const SUMMARY_OPEN_HANDOFF: Duration = Duration::from_millis(50);
+/// Workers alive at once, most of them waiting in an open.
+const SUMMARY_WORKER_LIMIT: usize = 32;
+const SUMMARY_WORKER_STACK_BYTES: usize = 256 * 1024;
+
 pub(super) fn scan(path: &Path, apparent: bool, exclusions: &ScanExclusions) -> io::Result<ScanReport> {
     let root = fsutil::open_directory(path)?;
     let entries = read_entries(&root)?;
-    let root_fd = root.as_fd();
-    let root_mount = mount_identity(root_fd)?;
-    let mut seen_directories = HashSet::new();
-    seen_directories.insert(fsutil::identity_of(root_fd)?);
-    let mut report = ScanReport {
-        directories: Vec::new(),
+    let root_mount = mount_identity(root.as_fd())?;
+    let mut state = SummaryState {
+        rows: Vec::new(),
+        paths: Vec::new(),
+        pending: Vec::new(),
+        seen_directories: HashSet::new(),
         skipped_entries: 0,
         mount_boundaries: 0,
         unsupported_aliases: 0,
+        timed_out: Vec::new(),
+        workers: HashMap::new(),
     };
+    state.seen_directories.insert(fsutil::identity_of(root.as_fd())?);
 
     for entry in entries {
         let exclusion_node = exclusions.child(exclusions.root_node(), entry.name.as_bytes());
@@ -314,10 +323,10 @@ pub(super) fn scan(path: &Path, apparent: bool, exclusions: &ScanExclusions) -> 
         let is_directory = match entry.kind {
             EntryKind::Directory => true,
             EntryKind::Other => false,
-            EntryKind::Unknown => match fsutil::stat_at(root_fd, &entry.name) {
+            EntryKind::Unknown => match fsutil::stat_at(root.as_fd(), &entry.name) {
                 Ok(stat) => fsutil::entry_type(&stat) == EntryType::Directory,
                 Err(_) => {
-                    mark_skipped(&mut report.skipped_entries);
+                    mark_skipped(&mut state.skipped_entries);
                     continue;
                 }
             },
@@ -325,233 +334,371 @@ pub(super) fn scan(path: &Path, apparent: bool, exclusions: &ScanExclusions) -> 
         if !is_directory {
             continue;
         }
+        state.paths.push(SummaryPath {
+            parent: None,
+            name: entry.name.clone(),
+            row: state.rows.len(),
+            exclusion_node: exclusion_node.filter(|node| exclusions.has_children(*node)),
+        });
+        state.rows.push(SummaryRow {
+            name: entry.name,
+            directory: None,
+            disk_size: 0,
+            state: RowState::Listed,
+        });
+    }
+    state.pending.extend((0..state.paths.len()).rev());
 
-        let directory = match fsutil::open_directory_at(root_fd, entry.name.as_c_str()) {
-            Ok(directory) => directory,
-            Err(_) => {
-                mark_skipped(&mut report.skipped_entries);
-                continue;
+    let scan = Arc::new(SummaryScan {
+        state: Mutex::new(state),
+        changed: Condvar::new(),
+        root,
+        root_mount,
+        apparent,
+        exclusions: exclusions.clone(),
+    });
+    fn poisoned<T>(_: T) -> io::Error {
+        io::Error::other("summary scan worker panicked")
+    }
+    let mut handles = HashMap::new();
+    let mut next_worker = 0u64;
+    let mut state = scan.state.lock().map_err(poisoned)?;
+    loop {
+        let now = Instant::now();
+        let timed_out = state
+            .workers
+            .iter()
+            .filter_map(|(worker, phase)| match phase {
+                WorkerPhase::Opening { path, started } if now - *started >= SUMMARY_OPEN_PATIENCE => {
+                    Some((*worker, *path))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (worker, path) in timed_out {
+            state.workers.remove(&worker);
+            handles.remove(&worker);
+            state.timed_out.push(path);
+            state.exclude_top_level(path, SummaryExclusion::OpenTimedOut);
+        }
+        handles.retain(|worker, handle: &mut thread::JoinHandle<()>| {
+            !handle.is_finished() || state.workers.contains_key(worker)
+        });
+        if handles.values().any(thread::JoinHandle::is_finished) {
+            return Err(io::Error::other("summary scan worker stopped before finishing"));
+        }
+        if state.pending.is_empty() && state.workers.is_empty() {
+            break;
+        }
+        let progressing = state.workers.values().any(|phase| match phase {
+            WorkerPhase::Listing => true,
+            WorkerPhase::Opening { started, .. } => now - *started < SUMMARY_OPEN_HANDOFF,
+        });
+        if !progressing && !state.pending.is_empty() && state.workers.len() < SUMMARY_WORKER_LIMIT {
+            state.workers.insert(next_worker, WorkerPhase::Listing);
+            handles.insert(next_worker, spawn_summary_worker(&scan, next_worker)?);
+            next_worker += 1;
+        }
+        state = scan.changed.wait_timeout(state, SUMMARY_OPEN_HANDOFF).map_err(poisoned)?.0;
+    }
+    Ok(state.report())
+}
+
+struct SummaryScan {
+    state: Mutex<SummaryState>,
+    /// Signalled when a worker stops, so the scan can finish or hand work on without waiting.
+    changed: Condvar,
+    root: OwnedFd,
+    root_mount: MountIdentity,
+    apparent: bool,
+    exclusions: ScanExclusions,
+}
+
+/// The summary's remaining work and results, shared so that a fresh worker can carry on when
+/// the current one is stuck in an open.
+struct SummaryState {
+    rows: Vec<SummaryRow>,
+    paths: Vec<SummaryPath>,
+    pending: Vec<usize>,
+    seen_directories: HashSet<FileIdentity>,
+    skipped_entries: usize,
+    mount_boundaries: usize,
+    unsupported_aliases: usize,
+    timed_out: Vec<usize>,
+    /// Live workers. One abandoned in an open is removed and discards its result if the open
+    /// ever returns.
+    workers: HashMap<u64, WorkerPhase>,
+}
+
+/// A directory below the root. Top-level directories have no parent and are opened from the
+/// root; the rest are opened from their top-level directory.
+struct SummaryPath {
+    parent: Option<usize>,
+    name: CString,
+    row: usize,
+    exclusion_node: Option<usize>,
+}
+
+struct SummaryRow {
+    name: CString,
+    directory: Option<Arc<OwnedFd>>,
+    disk_size: u64,
+    state: RowState,
+}
+
+enum RowState {
+    Listed,
+    Dropped,
+    Excluded(SummaryExclusion),
+}
+
+enum WorkerPhase {
+    Opening { path: usize, started: Instant },
+    Listing,
+}
+
+/// What one directory contributed, gathered without holding the summary lock.
+struct DirectoryListing {
+    disk_size: u64,
+    skipped_entries: usize,
+    child_directories: Vec<(CString, Option<usize>)>,
+}
+
+impl SummaryState {
+    /// The directory to open `path` from, and the names leading from it to `path`.
+    fn open_plan(&self, path: usize) -> (Option<Arc<OwnedFd>>, Vec<CString>) {
+        let mut names = Vec::new();
+        let mut current = path;
+        loop {
+            let entry = &self.paths[current];
+            match entry.parent {
+                Some(parent) => {
+                    names.push(entry.name.clone());
+                    current = parent;
+                }
+                None if current == path => return (None, vec![entry.name.clone()]),
+                None => break,
             }
-        };
-        let directory = match keep_directory_on_root_mount(directory, &root_mount) {
+        }
+        names.reverse();
+        let top_level = self.rows[self.paths[path].row]
+            .directory
+            .clone()
+            .expect("a top-level directory is open before its children are listed");
+        (Some(top_level), names)
+    }
+
+    fn drop_top_level(&mut self, path: usize) {
+        if self.paths[path].parent.is_none() {
+            let row = self.paths[path].row;
+            self.rows[row].state = RowState::Dropped;
+        }
+    }
+
+    fn exclude_top_level(&mut self, path: usize, exclusion: SummaryExclusion) {
+        if self.paths[path].parent.is_none() {
+            let row = self.paths[path].row;
+            self.rows[row].state = RowState::Excluded(exclusion);
+        }
+    }
+
+    fn accept_opened(&mut self, path: usize, opened: io::Result<OpenedDirectory>) -> Option<Arc<OwnedFd>> {
+        let directory = match opened {
             Ok(OpenedDirectory::InsideRoot(directory)) => directory,
             Ok(OpenedDirectory::MountBoundary) => {
-                mark_mount_boundary(&mut report.mount_boundaries);
-                report.directories.push(TopLevelDirectory {
-                    name: OsString::from_vec(entry.name.as_bytes().to_vec()),
-                    disk_size: 0,
-                    exclusion: Some(ExclusionReason::MountBoundary),
-                });
-                continue;
+                mark_mount_boundary(&mut self.mount_boundaries);
+                self.exclude_top_level(path, SummaryExclusion::MountBoundary);
+                return None;
             }
             Err(_) => {
-                mark_skipped(&mut report.skipped_entries);
-                continue;
+                mark_skipped(&mut self.skipped_entries);
+                self.drop_top_level(path);
+                return None;
             }
         };
         let identity = match fsutil::identity_of(directory.as_fd()) {
             Ok(identity) => identity,
             Err(_) => {
-                mark_skipped(&mut report.skipped_entries);
-                continue;
+                mark_skipped(&mut self.skipped_entries);
+                self.drop_top_level(path);
+                return None;
             }
         };
-        if !seen_directories.insert(identity) {
-            mark_unsupported_alias(&mut report.unsupported_aliases);
-            report.directories.push(TopLevelDirectory {
-                name: OsString::from_vec(entry.name.as_bytes().to_vec()),
-                disk_size: 0,
-                exclusion: Some(ExclusionReason::UnsupportedAlias),
-            });
-            continue;
+        if !self.seen_directories.insert(identity) {
+            mark_unsupported_alias(&mut self.unsupported_aliases);
+            self.exclude_top_level(path, SummaryExclusion::UnsupportedAlias);
+            return None;
         }
-        match scan_subtree(
-            directory,
-            &root_mount,
-            apparent,
-            &mut seen_directories,
-            &mut report,
-            exclusion_node.filter(|node| exclusions.has_children(*node)),
-            exclusions,
-        ) {
-            Ok(disk_size) => report.directories.push(TopLevelDirectory {
-                name: OsString::from_vec(entry.name.as_bytes().to_vec()),
-                disk_size,
-                exclusion: None,
-            }),
-            Err(_) => mark_skipped(&mut report.skipped_entries),
+        let directory = Arc::new(directory);
+        if self.paths[path].parent.is_none() {
+            let row = self.paths[path].row;
+            self.rows[row].directory = Some(Arc::clone(&directory));
+        }
+        Some(directory)
+    }
+
+    fn merge(&mut self, path: usize, listing: io::Result<DirectoryListing>) {
+        let listing = match listing {
+            Ok(listing) => listing,
+            Err(_) => {
+                mark_skipped(&mut self.skipped_entries);
+                self.drop_top_level(path);
+                return;
+            }
+        };
+        let row = self.paths[path].row;
+        add_size(&mut self.rows[row].disk_size, listing.disk_size, &mut self.skipped_entries);
+        self.skipped_entries = self.skipped_entries.saturating_add(listing.skipped_entries);
+        for (name, exclusion_node) in listing.child_directories {
+            self.pending.push(self.paths.len());
+            self.paths.push(SummaryPath { parent: Some(path), name, row, exclusion_node });
         }
     }
 
-    report
-        .directories
-        .sort_unstable_by(|left, right| {
+    fn relative_path(&self, path: usize) -> PathBuf {
+        let mut names = Vec::new();
+        let mut current = Some(path);
+        while let Some(index) = current {
+            names.push(OsStr::from_bytes(self.paths[index].name.as_bytes()));
+            current = self.paths[index].parent;
+        }
+        names.iter().rev().collect()
+    }
+
+    fn report(&self) -> ScanReport {
+        let mut directories = self
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let exclusion = match row.state {
+                    RowState::Listed => None,
+                    RowState::Dropped => return None,
+                    RowState::Excluded(exclusion) => Some(exclusion),
+                };
+                Some(TopLevelDirectory {
+                    name: OsString::from_vec(row.name.as_bytes().to_vec()),
+                    disk_size: if exclusion.is_some() { 0 } else { row.disk_size },
+                    exclusion,
+                })
+            })
+            .collect::<Vec<_>>();
+        directories.sort_unstable_by(|left, right| {
             left.exclusion
                 .is_some()
                 .cmp(&right.exclusion.is_some())
                 .then_with(|| right.disk_size.cmp(&left.disk_size))
         });
-    Ok(report)
-}
-
-fn scan_subtree(
-    root: OwnedFd,
-    root_mount: &MountIdentity,
-    apparent: bool,
-    seen_directories: &mut HashSet<FileIdentity>,
-    report: &mut ScanReport,
-    root_exclusion_node: Option<usize>,
-    exclusions: &ScanExclusions,
-) -> io::Result<u64> {
-    let mut paths = vec![DirectoryPath {
-        parent: None,
-        name: None,
-        exclusion_node: root_exclusion_node,
-    }];
-    let mut pending = vec![0usize];
-    let mut disk_size = 0u64;
-
-    while let Some(path_index) = pending.pop() {
-        let directory = if path_index == 0 {
-            OpenedDirectory::InsideRoot(root.try_clone()?)
-        } else {
-            match open_directory_path(root.as_fd(), root_mount, &paths, path_index) {
-                Ok(directory) => directory,
-                Err(_) => {
-                    mark_skipped(&mut report.skipped_entries);
-                    continue;
-                }
-            }
-        };
-        let directory = match directory {
-            OpenedDirectory::InsideRoot(directory) => directory,
-            OpenedDirectory::MountBoundary => {
-                mark_mount_boundary(&mut report.mount_boundaries);
-                continue;
-            }
-        };
-        if path_index != 0 {
-            let identity = match fsutil::identity_of(directory.as_fd()) {
-                Ok(identity) => identity,
-                Err(_) => {
-                    mark_skipped(&mut report.skipped_entries);
-                    continue;
-                }
-            };
-            if !seen_directories.insert(identity) {
-                mark_unsupported_alias(&mut report.unsupported_aliases);
-                continue;
-            }
-        }
-
-        let entries = match read_entries_with_metadata(&directory) {
-            Ok(entries) => entries,
-            Err(error) if path_index == 0 => return Err(error),
-            Err(_) => {
-                mark_skipped(&mut report.skipped_entries);
-                continue;
-            }
-        };
-
-        for entry in entries {
-            let exclusion_node =
-                exclusions.child(paths[path_index].exclusion_node, entry.name.as_bytes());
-            if exclusion_node.is_some_and(|node| exclusions.excludes(node)) {
-                continue;
-            }
-            let child_directory = match entry.kind {
-                EntryKind::Directory => true,
-                EntryKind::Other => {
-                    if let Some(bulk) = entry.bulk {
-                        let size = if apparent {
-                            bulk.apparent_bytes
-                        } else {
-                            bulk.allocated_bytes
-                        };
-                        add_size(&mut disk_size, size, &mut report.skipped_entries);
-                    } else {
-                        match fsutil::stat_at(directory.as_fd(), &entry.name)
-                            .and_then(|stat| fsutil::file_size(&stat, apparent))
-                        {
-                            Ok(size) => {
-                                add_size(&mut disk_size, size, &mut report.skipped_entries)
-                            }
-                            Err(_) => mark_skipped(&mut report.skipped_entries),
-                        }
-                    }
-                    continue;
-                }
-                EntryKind::Unknown => {
-                    match fsutil::stat_at(directory.as_fd(), &entry.name) {
-                        Ok(stat) if fsutil::entry_type(&stat) == EntryType::Directory => true,
-                        Ok(stat) => {
-                            match fsutil::file_size(&stat, apparent) {
-                                Ok(size) => {
-                                    add_size(&mut disk_size, size, &mut report.skipped_entries)
-                                }
-                                Err(_) => mark_skipped(&mut report.skipped_entries),
-                            }
-                            continue;
-                        }
-                        Err(_) => {
-                            mark_skipped(&mut report.skipped_entries);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            if child_directory {
-                let child_index = paths.len();
-                paths.push(DirectoryPath {
-                    parent: Some(path_index),
-                    name: Some(entry.name),
-                    exclusion_node: exclusion_node.filter(|node| exclusions.has_children(*node)),
-                });
-                pending.push(child_index);
-            }
+        ScanReport {
+            directories,
+            skipped_entries: self.skipped_entries,
+            mount_boundaries: self.mount_boundaries,
+            unsupported_aliases: self.unsupported_aliases,
+            timed_out_directories: self.timed_out.iter().map(|path| self.relative_path(*path)).collect(),
         }
     }
-
-    Ok(disk_size)
 }
 
-fn open_directory_path(
-    root: BorrowedFd<'_>,
+fn spawn_summary_worker(scan: &Arc<SummaryScan>, worker: u64) -> io::Result<thread::JoinHandle<()>> {
+    let scan = Arc::clone(scan);
+    thread::Builder::new()
+        .name("fdu-summary".to_owned())
+        .stack_size(SUMMARY_WORKER_STACK_BYTES)
+        .spawn(move || summary_worker(&scan, worker))
+}
+
+fn summary_worker(scan: &SummaryScan, worker: u64) {
+    let lock = || scan.state.lock().expect("summary scan state is not poisoned");
+    loop {
+        let (path, base, names) = {
+            let mut state = lock();
+            if !state.workers.contains_key(&worker) {
+                return;
+            }
+            let Some(path) = state.pending.pop() else {
+                state.workers.remove(&worker);
+                scan.changed.notify_all();
+                return;
+            };
+            let (base, names) = state.open_plan(path);
+            state.workers.insert(worker, WorkerPhase::Opening { path, started: Instant::now() });
+            (path, base, names)
+        };
+        let opened = open_relative(base.as_deref().map_or(scan.root.as_fd(), AsFd::as_fd), &names, &scan.root_mount);
+        drop(base);
+        let (directory, exclusion_node) = {
+            let mut state = lock();
+            match state.workers.get_mut(&worker) {
+                Some(phase) => *phase = WorkerPhase::Listing,
+                None => return,
+            }
+            match state.accept_opened(path, opened) {
+                Some(directory) => (directory, state.paths[path].exclusion_node),
+                None => continue,
+            }
+        };
+        let listing = list_directory(&directory, exclusion_node, scan);
+        drop(directory);
+        lock().merge(path, listing);
+    }
+}
+
+fn list_directory(
+    directory: &OwnedFd,
+    exclusion_node: Option<usize>,
+    scan: &SummaryScan,
+) -> io::Result<DirectoryListing> {
+    let exclusions = &scan.exclusions;
+    let mut listing = DirectoryListing { disk_size: 0, skipped_entries: 0, child_directories: Vec::new() };
+    for entry in read_entries_with_metadata(directory)? {
+        let child_exclusion_node = exclusions.child(exclusion_node, entry.name.as_bytes());
+        if child_exclusion_node.is_some_and(|node| exclusions.excludes(node)) {
+            continue;
+        }
+        let size = match entry.kind {
+            EntryKind::Directory => None,
+            EntryKind::Other => match entry.bulk {
+                Some(bulk) => Some(Ok(if scan.apparent { bulk.apparent_bytes } else { bulk.allocated_bytes })),
+                None => Some(
+                    fsutil::stat_at(directory.as_fd(), &entry.name)
+                        .and_then(|stat| fsutil::file_size(&stat, scan.apparent)),
+                ),
+            },
+            EntryKind::Unknown => match fsutil::stat_at(directory.as_fd(), &entry.name) {
+                Ok(stat) if fsutil::entry_type(&stat) == EntryType::Directory => None,
+                Ok(stat) => Some(fsutil::file_size(&stat, scan.apparent)),
+                Err(error) => Some(Err(error)),
+            },
+        };
+        match size {
+            None => listing.child_directories.push((
+                entry.name,
+                child_exclusion_node.filter(|node| exclusions.has_children(*node)),
+            )),
+            Some(Ok(size)) => add_size(&mut listing.disk_size, size, &mut listing.skipped_entries),
+            Some(Err(_)) => mark_skipped(&mut listing.skipped_entries),
+        }
+    }
+    Ok(listing)
+}
+
+/// Opens `names` in turn below `base`, stopping at the first one on another mount.
+fn open_relative(
+    base: BorrowedFd<'_>,
+    names: &[CString],
     root_mount: &MountIdentity,
-    paths: &[DirectoryPath],
-    path_index: usize,
 ) -> io::Result<OpenedDirectory> {
-    let mut components = Vec::new();
-    let mut current_index = Some(path_index);
-    while let Some(index) = current_index {
-        let path = &paths[index];
-        let Some(_) = path.parent else {
-            break;
-        };
-        components.push(index);
-        current_index = path.parent;
-    }
-
     let mut current: Option<OwnedFd> = None;
-    for component in components.into_iter().rev() {
-        let parent = current.as_ref().map_or(root, |directory| directory.as_fd());
-        let name = paths[component]
-            .name
-            .as_ref()
-            .expect("non-root directory path has a name");
+    for name in names {
+        let parent = current.as_ref().map_or(base, AsFd::as_fd);
         let directory = fsutil::open_directory_at(parent, name.as_c_str())?;
         match keep_directory_on_root_mount(directory, root_mount)? {
             OpenedDirectory::InsideRoot(directory) => current = Some(directory),
             OpenedDirectory::MountBoundary => return Ok(OpenedDirectory::MountBoundary),
         }
     }
-    current.map(OpenedDirectory::InsideRoot).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot reopen the root as a child directory",
-        )
-    })
+    current
+        .map(OpenedDirectory::InsideRoot)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no directory names to open"))
 }
 
 fn keep_directory_on_root_mount(

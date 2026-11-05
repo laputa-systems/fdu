@@ -32,7 +32,17 @@ pub struct ScanOptions {
 pub struct TopLevelDirectory {
     pub name: std::ffi::OsString,
     pub disk_size: u64,
-    pub exclusion: Option<fdu_core::ExclusionReason>,
+    pub exclusion: Option<SummaryExclusion>,
+}
+
+/// Why a summary row has no total.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SummaryExclusion {
+    MountBoundary,
+    UnsupportedAlias,
+    /// The directory did not open in time, typically because macOS is waiting for the user to
+    /// answer a privacy prompt for it.
+    OpenTimedOut,
 }
 
 /// Aggregate summary results and counts of omitted work.
@@ -41,6 +51,9 @@ pub struct ScanReport {
     pub skipped_entries: usize,
     pub mount_boundaries: usize,
     pub unsupported_aliases: usize,
+    /// Root-relative directories skipped because they did not open in time, top-level ones
+    /// included. Only the macOS scanner skips directories this way.
+    pub timed_out_directories: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -179,6 +192,9 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanReport> {
 }
 
 /// Scans the selected root while omitting exact relative paths and their subtrees.
+///
+/// On macOS a directory whose open does not return in time is skipped and reported, and the
+/// thread blocked in that open is left behind; it exits once the open returns.
 pub fn scan_with_exclusions(options: &ScanOptions, exclusions: &ScanExclusions) -> io::Result<ScanReport> {
     #[cfg(target_os = "linux")]
     {

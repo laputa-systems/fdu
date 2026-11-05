@@ -400,6 +400,7 @@ fn scan_mode<const APPARENT: bool>(path: &Path, exclusions: &ScanExclusions) -> 
         skipped_entries: skipped_entries.load(Ordering::Relaxed),
         mount_boundaries: mount_boundaries.load(Ordering::Relaxed),
         unsupported_aliases: 0,
+        timed_out_directories: Vec::new(),
     })
 }
 
@@ -443,7 +444,7 @@ fn scan_top_level_entry<const APPARENT: bool>(
     )? {
         OpenedChildDirectory::MountBoundary => {
             mount_boundaries.fetch_add(1, Ordering::Relaxed);
-            (0, Some(fdu_core::ExclusionReason::MountBoundary))
+            (0, Some(crate::SummaryExclusion::MountBoundary))
         }
         OpenedChildDirectory::Directory(child, child_ext4_eof_cookie) => {
             let disk_size = scan_directory_contents::<APPARENT>(
@@ -1179,7 +1180,7 @@ mod tests {
                 assert_eq!(directory.disk_size, 0);
                 assert_eq!(
                     directory.exclusion,
-                    Some(fdu_core::ExclusionReason::MountBoundary),
+                    Some(crate::SummaryExclusion::MountBoundary),
                 );
                 assert_eq!(skipped_entries.load(Ordering::Relaxed), 0);
                 assert_eq!(mount_boundaries.load(Ordering::Relaxed), 1);

@@ -24,7 +24,13 @@ and deletion planner.
 
 Summary output orders immediate child directories by descending size. On Linux
 the summary scanner uses four Rayon workers by default; `RAYON_NUM_THREADS`
-sets another count. The macOS summary scanner is sequential.
+sets another count. The macOS summary scanner lists one directory at a time.
+When a directory open stays pending for 50 ms, another worker continues with
+the remaining directories, so pending opens overlap; at most 32 workers are
+alive at once. A directory still unopened after two seconds is skipped and
+reported, and its worker is abandoned. Opening a folder covered by macOS
+privacy protection blocks until the user answers the consent prompt, and the
+summary does not wait for that.
 
 An immediate child that is itself a mount boundary is labeled `MOUNT BOUNDARY`
 on both platforms. The warning reports excluded boundaries. Contents below

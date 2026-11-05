@@ -51,8 +51,12 @@ prints each included immediate child directory in descending size order as a
 compact size (such as `5G` or `2.4M`), a tab, and a quoted name. Sizes use
 1024-based units. Root-level files are not listed. An immediate child that is a
 mount boundary is labeled `MOUNT BOUNDARY` on both platforms, and a warning
-reports excluded boundaries. Hidden names are included, and fdu does not read
-`.gitignore`.
+reports excluded boundaries. On macOS, a directory that does not open within
+two seconds, usually because macOS is waiting for you to answer a privacy
+prompt for it, is skipped: an immediate child is labeled
+`SKIPPED: OPEN TIMED OUT`, and a warning names the shallowest skipped
+directories and counts the rest. Grant your terminal Full Disk Access to scan
+them. Hidden names are included, and fdu does not read `.gitignore`.
 
 The browser shows each file or directory's modification age in one rounded
 unit, such as `5m`, `1h`, `4w`, or `20mo`.

@@ -5,8 +5,7 @@ mod browser;
 #[cfg(feature = "interactive")]
 mod rmrf;
 
-use fdu_core::ExclusionReason;
-use fdu_scan::{scan_with_exclusions, ScanExclusions, ScanOptions, TopLevelDirectory};
+use fdu_scan::{scan_with_exclusions, ScanExclusions, ScanOptions, SummaryExclusion, TopLevelDirectory};
 use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
@@ -119,6 +118,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             report.unsupported_aliases
         );
     }
+    write_timed_out_warning(&mut io::stderr().lock(), &report.timed_out_directories)?;
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -131,14 +131,53 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn write_summary_entry(output: &mut impl Write, directory: &TopLevelDirectory) -> io::Result<()> {
     match directory.exclusion {
-        Some(ExclusionReason::MountBoundary) => {
+        Some(SummaryExclusion::MountBoundary) => {
             writeln!(output, "MOUNT BOUNDARY\t{:?}", directory.name)
         }
-        Some(ExclusionReason::UnsupportedAlias) => {
+        Some(SummaryExclusion::UnsupportedAlias) => {
             writeln!(output, "UNSUPPORTED DIRECTORY ALIAS\t{:?}", directory.name)
+        }
+        Some(SummaryExclusion::OpenTimedOut) => {
+            writeln!(output, "SKIPPED: OPEN TIMED OUT\t{:?}", directory.name)
         }
         None => writeln!(output, "{}\t{:?}", format_summary_size(directory.disk_size), directory.name),
     }
+}
+
+/// Directories the timed-out warning names one by one; the rest are counted by area.
+const NAMED_TIMED_OUT_DIRECTORIES: usize = 10;
+
+fn write_timed_out_warning(output: &mut impl Write, directories: &[PathBuf]) -> io::Result<()> {
+    if directories.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "fdu: warning: skipped {} directories that did not open in time, usually because macOS is waiting for a privacy prompt to be answered; totals omit them:",
+        directories.len()
+    )?;
+    let mut shallowest_first = directories.iter().collect::<Vec<_>>();
+    shallowest_first.sort_by(|left, right| {
+        left.components().count().cmp(&right.components().count()).then_with(|| left.cmp(right))
+    });
+    let (named, rest) = shallowest_first.split_at(shallowest_first.len().min(NAMED_TIMED_OUT_DIRECTORIES));
+    for directory in named {
+        writeln!(output, "fdu:   {directory:?}")?;
+    }
+    if rest.is_empty() {
+        return Ok(());
+    }
+    let mut areas = std::collections::BTreeMap::<PathBuf, usize>::new();
+    for directory in rest {
+        let area = directory.components().take(2).collect::<PathBuf>();
+        *areas.entry(area).or_default() += 1;
+    }
+    let areas = areas
+        .iter()
+        .map(|(area, count)| format!("{count} in {area:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "fdu:   and {} more: {areas}", rest.len())
 }
 
 fn format_summary_size(bytes: u64) -> String {
@@ -420,9 +459,8 @@ fn run_interactive(
 
 #[cfg(test)]
 mod tests {
-    use super::{automatic_mode_uses_tui, parse_args_from, write_summary_entry};
-    use fdu_core::ExclusionReason;
-    use fdu_scan::TopLevelDirectory;
+    use super::{automatic_mode_uses_tui, parse_args_from, write_summary_entry, write_timed_out_warning};
+    use fdu_scan::{SummaryExclusion, TopLevelDirectory};
     use std::ffi::OsString;
     use std::io;
     use std::path::PathBuf;
@@ -439,10 +477,42 @@ mod tests {
             &TopLevelDirectory {
                 name: OsString::from("mounted"),
                 disk_size: 0,
-                exclusion: Some(ExclusionReason::MountBoundary),
+                exclusion: Some(SummaryExclusion::MountBoundary),
             },
         ).unwrap();
-        assert_eq!(String::from_utf8(output).unwrap(), "42B\t\"included\"\nMOUNT BOUNDARY\t\"mounted\"\n");
+        write_summary_entry(
+            &mut output,
+            &TopLevelDirectory {
+                name: OsString::from("Desktop"),
+                disk_size: 0,
+                exclusion: Some(SummaryExclusion::OpenTimedOut),
+            },
+        ).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "42B\t\"included\"\nMOUNT BOUNDARY\t\"mounted\"\nSKIPPED: OPEN TIMED OUT\t\"Desktop\"\n"
+        );
+    }
+
+    #[test]
+    fn timed_out_warning_names_the_shallowest_directories_and_counts_the_rest_by_area() {
+        let mut directories = vec![PathBuf::from("Library/Mobile Documents"), PathBuf::from("Desktop")];
+        directories.extend((0..9).map(|index| PathBuf::from(format!("Library/Containers/app{index}/Data"))));
+        directories.push(PathBuf::from("Library/Group Containers/group.mail"));
+        let mut output = Vec::new();
+        write_timed_out_warning(&mut output, &directories).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert!(lines[0].starts_with("fdu: warning: skipped 12 directories that did not open in time"), "{output}");
+        assert_eq!(lines[1], "fdu:   \"Desktop\"");
+        assert_eq!(lines[2], "fdu:   \"Library/Mobile Documents\"");
+        assert_eq!(lines[3], "fdu:   \"Library/Group Containers/group.mail\"");
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[11], "fdu:   and 2 more: 2 in \"Library/Containers\"");
+
+        let mut quiet = Vec::new();
+        write_timed_out_warning(&mut quiet, &[]).unwrap();
+        assert!(quiet.is_empty());
     }
 
     #[test]
