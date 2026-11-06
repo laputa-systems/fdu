@@ -2,7 +2,7 @@ size: columns=100 rows=24
 cursor: row=0 column=0 visible=false
 modes: alternate-screen=true application-cursor=false application-keypad=false bracketed-paste=false
 00│·fdu···read·only···apparent·sizes···································································
-01│┌·.work/tmp/fdu-layout-fixture·(48·shown,·48·total,·51.9·KiB)──────────────────────────────────────┐
+01│┌·.work/tmp/fdu-layout-fixture·(48·shown,·192238·total,·51.9·KiB)──────────────────────────────────┐
 02││[x]·····17.5·KiB··33.7%·███·········<age>·directory-000030/·······································│
 03││·········8.3·KiB··15.9%·██··········<age>·directory-000006/·······································│
 04││·········5.0·KiB···9.6%·█···········<age>·directory-000001/·······································│
@@ -26,7 +26,7 @@ modes: alternate-screen=true application-cursor=false application-keypad=false b
 22│└──────────────────────────────────────────────────────────────────────────────────────────────────┘
 23│·192238·entries···d·mark···Tab·marked···-·split···s·sort···/·filter···?·help···q·quit···············
 attr: row=0 columns=0..100 fg=Default bg=Default bold=false dim=false italic=false underline=false inverse=true
-attr: row=1 columns=1..61 fg=Default bg=Default bold=true dim=false italic=false underline=false inverse=false
+attr: row=1 columns=1..65 fg=Default bg=Default bold=true dim=false italic=false underline=false inverse=false
 attr: row=2 columns=1..99 fg=Indexed(1) bg=Default bold=false dim=false italic=false underline=false inverse=false
 attr: row=3 columns=1..99 fg=Indexed(4) bg=Default bold=true dim=false italic=false underline=false inverse=true
 attr: row=4 columns=1..99 fg=Indexed(4) bg=Default bold=true dim=false italic=false underline=false inverse=false

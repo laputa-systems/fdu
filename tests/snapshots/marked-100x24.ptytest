@@ -2,7 +2,7 @@ size: columns=100 rows=24
 cursor: row=0 column=0 visible=false
 modes: alternate-screen=true application-cursor=false application-keypad=false bracketed-paste=false
 00│·fdu···read·only···apparent·sizes···································································
-01│┌·…p/fdu-layout-fixture·(48·shown,·48·total,·51.9·KiB)┐┌·Marked·2·items·(25.8·KiB,·49.7%·of·51.9·K…┐
+01│┌·…u-layout-fixture·(48·shown,·192238·total,·51.9·KiB)┐┌·Marked·2·items·(25.8·KiB,·49.7%·of·51.9·K…┐
 02││[x]·····17.5·KiB··33.7%··<age>·directory-000030/·····││·····17.5·KiB·<age>··directory-000030/·····│
 03││[x]······8.3·KiB··15.9%··<age>·directory-000006/·····││······8.3·KiB·<age>··directory-000006/·····│
 04││·········5.0·KiB···9.6%··<age>·directory-000001/·····││···········································│

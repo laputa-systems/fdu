@@ -80,14 +80,14 @@ fn index_fixture(root: &Path) -> Tree {
     let mut nodes = vec![Some(tree.root())];
     run_indexed_scan(root, |event| match event {
         ScanEvent::Entries(batch) => {
-            let mut run: Option<(fdu_core::NodeId, u64, u64)> = None;
+            let mut run: Option<(fdu_core::NodeId, u64, u64, u32)> = None;
             for entry in &batch.entries {
                 let parent = nodes[entry.parent.0 as usize].expect("entries follow their directory's entry");
                 if run.is_some_and(|(node, ..)| node != parent) {
-                    let (node, apparent, allocated) = run.take().unwrap();
-                    assert!(tree.add_to_ancestors(node, apparent, allocated));
+                    let (node, apparent, allocated, entries) = run.take().unwrap();
+                    assert!(tree.add_to_ancestors(node, apparent, allocated, entries));
                 }
-                let (_, apparent, allocated) = run.get_or_insert((parent, 0, 0));
+                let (_, apparent, allocated, entries) = run.get_or_insert((parent, 0, 0, 0));
                 let name = &batch.names[entry.name.start as usize..entry.name.end as usize];
                 let id = tree
                     .append(
@@ -101,6 +101,7 @@ fn index_fixture(root: &Path) -> Tree {
                         entry.state,
                     )
                     .expect("index has room");
+                *entries += 1;
                 if let Some(token) = entry.directory_token {
                     let index = token.0 as usize;
                     if nodes.len() <= index {
@@ -113,8 +114,8 @@ fn index_fixture(root: &Path) -> Tree {
                     *allocated += entry.allocated_bytes;
                 }
             }
-            if let Some((node, apparent, allocated)) = run {
-                assert!(tree.add_to_ancestors(node, apparent, allocated));
+            if let Some((node, apparent, allocated, entries)) = run {
+                assert!(tree.add_to_ancestors(node, apparent, allocated, entries));
             }
         }
         ScanEvent::DirectoriesFinished(directories) => {

@@ -2,7 +2,7 @@ size: columns=100 rows=24
 cursor: row=0 column=0 visible=false
 modes: alternate-screen=true application-cursor=false application-keypad=false bracketed-paste=false
 00│·fdu···read·only···apparent·sizes···································································
-01│┌·…ure/directory-000030·(26·shown,·26·total,·17.5·KiB)┐┌·Marked·1·item·(17.5·KiB,·33.7%·of·51.9·Ki…┐
+01│┌·…/directory-000030·(26·shown,·66866·total,·17.5·KiB)┐┌·Marked·1·item·(17.5·KiB,·33.7%·of·51.9·Ki…┐
 02││[=]·····17.4·KiB··99.3%··<age>·directory-000001/·····││·····17.5·KiB·<age>··directory-000030/·····│
 03││[=]·········60·B···0.3%··<age>·directory-000000/·····││···········································│
 04││[=]·········25·B···0.1%··<age>·directory-000004/·····││···········································│

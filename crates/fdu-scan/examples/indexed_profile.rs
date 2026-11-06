@@ -57,10 +57,10 @@ fn main() -> io::Result<()> {
             ScanEvent::Entries(mut batch) => {
                 first_batch.get_or_insert_with(|| started.elapsed());
                 // Totals are added once per run of entries with the same parent.
-                let mut run: Option<(fdu_core::NodeId, u64, u64, bool)> = None;
-                let finish_run = |tree: &mut Tree, scan_errors: &mut usize, run: (fdu_core::NodeId, u64, u64, bool)| {
-                    let (parent, apparent, allocated, fits) = run;
-                    if !fits || !tree.add_to_ancestors(parent, apparent, allocated) {
+                let mut run: Option<(fdu_core::NodeId, u64, u64, u32, bool)> = None;
+                let finish_run = |tree: &mut Tree, scan_errors: &mut usize, run: (fdu_core::NodeId, u64, u64, u32, bool)| {
+                    let (parent, apparent, allocated, entries, fits) = run;
+                    if !fits || !tree.add_to_ancestors(parent, apparent, allocated, entries) {
                         tree.mark_incomplete_to_root(parent);
                         *scan_errors = scan_errors.saturating_add(1);
                     }
@@ -74,7 +74,7 @@ fn main() -> io::Result<()> {
                     if run.is_some_and(|(node, ..)| node != parent) {
                         finish_run(&mut tree, &mut scan_errors, run.take().unwrap());
                     }
-                    let (_, apparent_batch, allocated_batch, totals_fit) = run.get_or_insert((parent, 0, 0, true));
+                    let (_, apparent_batch, allocated_batch, entry_count, totals_fit) = run.get_or_insert((parent, 0, 0, 0, true));
                     let name = batch
                         .names
                         .get(entry.name.start as usize..entry.name.end as usize)
@@ -91,6 +91,7 @@ fn main() -> io::Result<()> {
                             entry.state,
                         )
                         .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "index capacity exceeded"))?;
+                    *entry_count += 1;
                     if let Some(token) = entry.directory_token {
                         let token_index = token.0 as usize;
                         if token_nodes.len() <= token_index {

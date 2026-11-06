@@ -154,7 +154,7 @@ pub struct View<'a> {
     pub sort_mode: SortMode,
     pub phase: Phase,
     pub indexed_entries: usize,
-    pub directory_items: usize,
+    pub total_entries: usize,
     pub visible_items: usize,
     pub incomplete_entries: usize,
     pub exclusions: usize,
@@ -311,7 +311,7 @@ fn render_browser(frame: &mut Screen, area: Rect, view: &View<'_>, scroll: &mut 
     let counts = format!(
         " ({} shown, {} total, {})",
         view.visible_items,
-        view.directory_items,
+        view.total_entries,
         format_size(total)
     );
     let root = root_name(view);
@@ -956,10 +956,11 @@ mod tests {
             tree.append(parent, name, kind, FileIdentity { device: 1, inode }, 1, bytes, bytes, NodeStatus::Complete).unwrap()
         };
         let directory = append(&mut tree, root, b"projects", EntryType::Directory, 2, 0);
+        assert!(tree.add_to_ancestors(root, 0, 0, 1));
         let nested = append(&mut tree, directory, b"payload.bin", EntryType::RegularFile, 3, 4096);
-        assert!(tree.add_to_ancestors(directory, 4096, 4096));
+        assert!(tree.add_to_ancestors(directory, 4096, 4096, 1));
         let top = append(&mut tree, root, b"top.log", EntryType::RegularFile, 4, 1024);
-        assert!(tree.add_to_ancestors(root, 1024, 1024));
+        assert!(tree.add_to_ancestors(root, 1024, 1024, 1));
         Fixture { tree, root, directory, nested, top, waiting_for_access: HashSet::new() }
     }
 
@@ -992,7 +993,10 @@ mod tests {
             sort_mode: SortMode::Size,
             phase: Phase::Ready,
             indexed_entries: rows.len(),
-            directory_items: rows.len(),
+            total_entries: fixture
+                .tree
+                .record(fixture.root)
+                .map_or(rows.len(), |record| record.descendant_entries as usize),
             visible_items: rows.len(),
             incomplete_entries: 0,
             exclusions: 0,

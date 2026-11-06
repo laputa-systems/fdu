@@ -1148,9 +1148,8 @@ mod tests {
                 for entry in entries {
                     append_path(tree, id, &entry.path(), entry.file_name().as_bytes())?;
                 }
-            } else {
-                assert!(tree.add_to_ancestors(parent, apparent, allocated));
             }
+            assert!(tree.add_to_ancestors(parent, apparent, allocated, 1));
             Ok(id)
         }
 

@@ -181,6 +181,7 @@ pub struct NodeRecord {
     pub link_count: u64,
     pub apparent_bytes: u64,
     pub allocated_bytes: u64,
+    pub descendant_entries: u32,
     pub state: NodeState,
 }
 
@@ -235,6 +236,7 @@ impl Tree {
                 link_count,
                 apparent_bytes: 0,
                 allocated_bytes: 0,
+                descendant_entries: 0,
                 state: NodeState::Scanning,
             }],
             names,
@@ -314,6 +316,7 @@ impl Tree {
             link_count,
             apparent_bytes,
             allocated_bytes,
+            descendant_entries: 0,
             state: state.into(),
         });
         if let Some(last) = self.nodes[parent.index()].last_child {
@@ -341,9 +344,9 @@ impl Tree {
         true
     }
 
-    /// Adds bytes to `id` and every ancestor, or to none of them: when any total would overflow,
-    /// the lineage is marked incomplete instead and false is returned.
-    pub fn add_to_ancestors(&mut self, id: NodeId, apparent: u64, allocated: u64) -> bool {
+    /// Adds bytes and entry counts to `id` and every ancestor, or to none of them: when any
+    /// total would overflow, the lineage is marked incomplete instead and false is returned.
+    pub fn add_to_ancestors(&mut self, id: NodeId, apparent: u64, allocated: u64, entries: u32) -> bool {
         let mut fits = true;
         let mut current = Some(id);
         while let Some(node) = current {
@@ -352,6 +355,7 @@ impl Tree {
             };
             if record.apparent_bytes.checked_add(apparent).is_none()
                 || record.allocated_bytes.checked_add(allocated).is_none()
+                || record.descendant_entries.checked_add(entries).is_none()
             {
                 fits = false;
                 break;
@@ -364,6 +368,7 @@ impl Tree {
             if fits {
                 record.apparent_bytes += apparent;
                 record.allocated_bytes += allocated;
+                record.descendant_entries += entries;
             } else {
                 record.state = NodeState::Incomplete;
             }
@@ -406,18 +411,22 @@ impl Tree {
         if id == self.root {
             return None;
         }
-        let (apparent, allocated, parent) = {
+        let (apparent, allocated, descendant_entries, parent) = {
             let record = self.record(id)?;
             if record.state == NodeState::Tombstone {
                 return Some((0, 0, 0));
             }
-            (record.apparent_bytes, record.allocated_bytes, record.parent?)
+            (record.apparent_bytes, record.allocated_bytes, record.descendant_entries, record.parent?)
         };
+        let removed_entries = descendant_entries.saturating_add(1);
         let mut current = Some(parent);
         let mut lineage = Vec::new();
         while let Some(node) = current {
             let record = self.nodes.get(node.index())?;
-            if record.apparent_bytes < apparent || record.allocated_bytes < allocated {
+            if record.apparent_bytes < apparent
+                || record.allocated_bytes < allocated
+                || record.descendant_entries < removed_entries
+            {
                 return None;
             }
             lineage.push(node);
@@ -457,6 +466,7 @@ impl Tree {
             let record = &mut self.nodes[node.index()];
             record.apparent_bytes -= apparent;
             record.allocated_bytes -= allocated;
+            record.descendant_entries -= removed_entries;
         }
         Some((apparent, allocated, tombstoned))
     }
@@ -554,6 +564,7 @@ pub fn fold_entry_batch(
         parent: NodeId,
         apparent: u64,
         allocated: u64,
+        entries: u32,
         fits: bool,
         problem: bool,
     }
@@ -569,7 +580,7 @@ pub fn fold_entry_batch(
                 continue;
             };
             run_token = Some(entry.parent);
-            runs.push(Run { parent, apparent: 0, allocated: 0, fits: true, problem: false });
+            runs.push(Run { parent, apparent: 0, allocated: 0, entries: 0, fits: true, problem: false });
         }
         let run = runs.last_mut().expect("a run exists for the current directory");
         let Some(name) = batch.names.get(entry.name.start as usize..entry.name.end as usize) else {
@@ -596,6 +607,7 @@ pub fn fold_entry_batch(
         };
         assert!(tree.set_modified_time(id, entry.modified_time));
         outcome.appended.push(id);
+        run.entries = run.entries.saturating_add(1);
         if let Some(token) = entry.directory_token {
             let index = token.0 as usize;
             if token_nodes.len() <= index {
@@ -638,10 +650,9 @@ pub fn fold_entry_batch(
         if run.problem {
             outcome.marked_incomplete += tree.mark_incomplete_to_root(run.parent);
         }
-        // Directories add nothing to their ancestors' totals, so a run of them skips the walk.
         let added = !run.fits
-            || (run.apparent == 0 && run.allocated == 0)
-            || tree.add_to_ancestors(run.parent, run.apparent, run.allocated);
+            || (run.entries == 0 && run.apparent == 0 && run.allocated == 0)
+            || tree.add_to_ancestors(run.parent, run.apparent, run.allocated, run.entries);
         if !run.fits || !added {
             outcome.overflow = true;
             outcome.marked_incomplete += tree.mark_incomplete_to_root(run.parent);
@@ -729,6 +740,7 @@ mod tests {
                 NodeStatus::Complete,
             )
             .unwrap();
+        assert!(tree.add_to_ancestors(tree.root(), 0, 0, 1));
         let file = tree
             .append(
                 directory,
@@ -741,11 +753,15 @@ mod tests {
                 NodeStatus::Complete,
             )
             .unwrap();
-        assert!(tree.add_to_ancestors(directory, 7, 512));
+        assert!(tree.add_to_ancestors(directory, 7, 512, 1));
         assert_eq!(tree.record(tree.root()).unwrap().apparent_bytes, 7);
+        assert_eq!(tree.record(tree.root()).unwrap().descendant_entries, 2);
+        assert_eq!(tree.record(directory).unwrap().descendant_entries, 1);
         assert_eq!(tree.tombstone_subtree(file), Some((7, 512, 1)));
         assert_eq!(tree.record(directory).unwrap().apparent_bytes, 0);
+        assert_eq!(tree.record(directory).unwrap().descendant_entries, 0);
         assert_eq!(tree.tombstone_subtree(directory), Some((0, 0, 1)));
+        assert_eq!(tree.record(tree.root()).unwrap().descendant_entries, 0);
         assert_eq!(tree.tombstone_subtree(directory), Some((0, 0, 0)));
         assert_eq!(tree.record(tree.root()).unwrap().allocated_bytes, 0);
         assert!(tree.children(directory).next().is_none());
@@ -856,6 +872,8 @@ mod tests {
         assert_eq!(tree.record(tree.root()).unwrap().state, NodeState::Incomplete);
         assert_eq!(tree.record(tree.root()).unwrap().apparent_bytes, 100);
         assert_eq!(tree.record(tree.root()).unwrap().allocated_bytes, 512);
+        assert_eq!(tree.record(tree.root()).unwrap().descendant_entries, 3);
+        assert_eq!(tree.record(sub).unwrap().descendant_entries, 0);
 
         assert_eq!(finish_scan_directory(tree, token_nodes, DirectoryToken(1), true), 0);
         assert_eq!(tree.record(sub).unwrap().state, NodeState::Complete);
@@ -915,8 +933,8 @@ mod tests {
                 NodeStatus::Complete,
             )
             .unwrap();
-        assert!(tree.add_to_ancestors(tree.root(), u64::MAX, u64::MAX));
-        assert!(!tree.add_to_ancestors(directory, 1, 1));
+        assert!(tree.add_to_ancestors(tree.root(), u64::MAX, u64::MAX, 0));
+        assert!(!tree.add_to_ancestors(directory, 1, 1, 1));
         assert_eq!(tree.record(directory).unwrap().apparent_bytes, 0);
         assert_eq!(tree.record(tree.root()).unwrap().apparent_bytes, u64::MAX);
         assert_eq!(tree.record(directory).unwrap().state, NodeState::Incomplete);

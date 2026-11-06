@@ -1024,7 +1024,10 @@ impl BrowserModel {
             sort_mode: self.sort_mode,
             phase: phase.view_phase(),
             indexed_entries: self.indexed_entries,
-            directory_items: self.listing.len(),
+            total_entries: self
+                .tree
+                .record(self.current_directory)
+                .map_or(0, |record| record.descendant_entries as usize),
             visible_items: self.visible.len(),
             incomplete_entries: self.incomplete_entries,
             exclusions: self.exclusions,
@@ -2087,9 +2090,12 @@ mod tests {
                 state,
             )
             .unwrap();
-        if entry_type != EntryType::Directory {
-            assert!(tree.add_to_ancestors(parent, bytes, bytes));
-        }
+        assert!(tree.add_to_ancestors(
+            parent,
+            if entry_type == EntryType::Directory { 0 } else { bytes },
+            if entry_type == EntryType::Directory { 0 } else { bytes },
+            1,
+        ));
         model.indexed_entries = model.tree.len().saturating_sub(1);
         if parent == model.current_directory {
             model.listing.push(id);

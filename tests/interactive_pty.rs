@@ -32,8 +32,8 @@ fn startup_shows_a_minimal_title_and_the_entry_count_and_restores_the_terminal()
     for name in ["alpha/", "beta/", "top.txt"] {
         assert!(screen.shows(name), "{name} is listed");
     }
-    // The pane title names the root and shows the count and total.
-    assert!(screen.shows("root (3 shown, 3 total,"));
+    // The pane title names the root and shows the visible count and recursive total.
+    assert!(screen.shows("root (3 shown, 6 total,"));
     // The bottom bar leads with the total entry count (3 at the top plus 3
     // below) and follows it with the key hints.
     let status = screen.lines().pop().unwrap();
@@ -215,14 +215,14 @@ fn marked_pane_shows_marks_hidden_by_a_filter_and_reveals_them() -> io::Result<(
     session.text("/");
     session.text("alpha");
     session.key(Key::Enter);
-    let screen = session.wait("filtered list", |screen| screen.shows("(1 shown, 3 total"));
+    let screen = session.wait("filtered list", |screen| screen.shows("(1 shown, 6 total"));
     assert!(!screen.shows("beta/"), "the filter hides non-matching rows");
     assert!(screen.shows("Marked 1 item"), "the mark is still counted");
     assert!(screen.shows("filter \"alpha\""));
 
     session.key(Key::Tab);
     session.key(Key::Enter); // show top.txt where it lives
-    session.wait("filter cleared", |screen| screen.shows("(3 shown, 3 total") && screen.shows("Filter cleared"));
+    session.wait("filter cleared", |screen| screen.shows("(3 shown, 6 total") && screen.shows("Filter cleared"));
     session.quit();
     Ok(())
 }

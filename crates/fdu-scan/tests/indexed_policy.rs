@@ -131,7 +131,7 @@ fn scan_to_tree_with_exclusions(
                 batches.push(batch.entries.len());
                 // Entries of several directories share a batch; totals are added per run of
                 // entries with the same parent.
-                let mut run: Option<(NodeId, u64, u64)> = None;
+                let mut run: Option<(NodeId, u64, u64, u32)> = None;
                 for entry in &batch.entries {
                     assert!(
                         !(root_listed && entry.parent == DirectoryToken(0)),
@@ -142,11 +142,11 @@ fn scan_to_tree_with_exclusions(
                         .copied()
                         .flatten()
                         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown directory token"))?;
-                    if run.is_some_and(|(node, _, _)| node != parent) {
-                        let (node, apparent, allocated) = run.take().unwrap();
-                        assert!(tree.add_to_ancestors(node, apparent, allocated));
+                    if run.is_some_and(|(node, _, _, _)| node != parent) {
+                        let (node, apparent, allocated, entries) = run.take().unwrap();
+                        assert!(tree.add_to_ancestors(node, apparent, allocated, entries));
                     }
-                    let (_, apparent, allocated) = run.get_or_insert((parent, 0, 0));
+                    let (_, apparent, allocated, entries) = run.get_or_insert((parent, 0, 0, 0));
                     let name = &batch.names[entry.name.start as usize..entry.name.end as usize];
                     let id = tree
                         .append(
@@ -161,6 +161,7 @@ fn scan_to_tree_with_exclusions(
                         )
                         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "index exhausted"))?;
                     assert!(tree.set_modified_time(id, entry.modified_time));
+                    *entries += 1;
                     if let Some(token) = entry.directory_token {
                         if tokens.len() <= token.0 as usize {
                             tokens.resize(token.0 as usize + 1, None);
@@ -186,8 +187,8 @@ fn scan_to_tree_with_exclusions(
                         _ => {}
                     }
                 }
-                if let Some((node, apparent, allocated)) = run {
-                    assert!(tree.add_to_ancestors(node, apparent, allocated));
+                if let Some((node, apparent, allocated, entries)) = run {
+                    assert!(tree.add_to_ancestors(node, apparent, allocated, entries));
                 }
                 batch.clear();
                 let _ = batch_sender.try_send(batch);
