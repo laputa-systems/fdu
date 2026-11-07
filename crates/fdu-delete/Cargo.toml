@@ -9,4 +9,5 @@ description = "Descriptor-relative deletion for fdu indexes"
 fdu-core = { path = "../fdu-core" }
 hashbrown = { workspace = true }
 rayon = "1.5.1"
+rustc-hash = "2"
 rustix = { version = "1.1", features = ["fs", "std", "linux_latest"] }

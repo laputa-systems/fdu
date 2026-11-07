@@ -167,11 +167,13 @@ fn write_timed_out_warning(output: &mut impl Write, directories: &[PathBuf]) -> 
     if rest.is_empty() {
         return Ok(());
     }
-    let mut areas = std::collections::BTreeMap::<PathBuf, usize>::new();
+    let mut areas = hashbrown::HashMap::<PathBuf, usize>::new();
     for directory in rest {
         let area = directory.components().take(2).collect::<PathBuf>();
         *areas.entry(area).or_default() += 1;
     }
+    let mut areas = areas.into_iter().collect::<Vec<_>>();
+    areas.sort_unstable();
     let areas = areas
         .iter()
         .map(|(area, count)| format!("{count} in {area:?}"))
