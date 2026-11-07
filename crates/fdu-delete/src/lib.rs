@@ -315,9 +315,9 @@ pub fn execute(
 mod posix {
     mod quarantine;
     use super::*;
+    use rustc_hash::FxHashMap;
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
     use rustix::io::Errno;
-    use std::collections::BTreeMap;
     use std::os::fd::{AsFd, BorrowedFd};
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::Mutex;
@@ -460,7 +460,7 @@ mod posix {
 
         // Selected entries are grouped by the directory they live in, so each such directory is
         // opened once.
-        let mut groups: BTreeMap<usize, Vec<NodeId>> = BTreeMap::new();
+        let mut groups: FxHashMap<usize, Vec<NodeId>> = FxHashMap::default();
         for selected in &plan.roots {
             let parent = tree
                 .record(*selected)
